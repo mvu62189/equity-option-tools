@@ -1,0 +1,27 @@
+﻿provider: yfinance
+required_fields:
+  - contractSymbol
+  - strike
+  - bid
+  - ask
+  - volume
+  - openInterest
+  - lastPrice
+  - impliedVolatility
+  - expiration
+  - optionType
+  - asofTs
+  - underlyingPrice
+field_map:
+  contractSymbol: symbol
+  strike: strike
+  bid: bid
+  ask: ask
+  volume: volume
+  openInterest: open_interest
+  lastPrice: last
+  impliedVolatility: implied_vol_vendor
+  expiration: expiration
+  optionType: option_type
+  asofTs: asof_ts
+  underlyingPrice: underlying_price

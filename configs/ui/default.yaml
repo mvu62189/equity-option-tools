@@ -1,0 +1,3 @@
+﻿window_title: "Quant Pipeline MVP"
+refresh_ms: 1000
+default_ticker: "SPY"
