@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -8,6 +9,8 @@ import polars as pl
 import yfinance as yf
 
 from .base import ProviderAdapter
+
+logger = logging.getLogger(__name__)
 
 
 class YFinanceAdapter(ProviderAdapter):
@@ -18,6 +21,12 @@ class YFinanceAdapter(ProviderAdapter):
 
     async def fetch_full_snapshot(self, symbol: str) -> pl.DataFrame:
         return await asyncio.to_thread(self._fetch_full_snapshot_sync, symbol)
+
+    async def fetch_available_expirations(self, symbol: str) -> list[str]:
+        return await asyncio.to_thread(self.fetch_available_expirations_sync, symbol)
+
+    async def search_symbols(self, query: str, *, max_results: int = 5) -> list[dict[str, str]]:
+        return await asyncio.to_thread(self.search_symbols_sync, query, max_results)
 
     @staticmethod
     def _resolve_expiries(exps: list[str], expiration: str | None) -> list[str]:
@@ -76,6 +85,55 @@ class YFinanceAdapter(ProviderAdapter):
             rows.append(self._normalize_leg(chain.puts, exp, "put", now, spot))
 
         return pl.from_pandas(pd.concat(rows, ignore_index=True))
+
+    def fetch_available_expirations_sync(self, symbol: str) -> list[str]:
+        normalized = symbol.strip().upper()
+        if not normalized:
+            return []
+        try:
+            return [str(exp) for exp in yf.Ticker(normalized).options if exp]
+        except Exception:
+            logger.exception("yfinance_fetch_expirations_failed symbol=%s", normalized)
+            return []
+
+    def search_symbols_sync(self, query: str, max_results: int = 5) -> list[dict[str, str]]:
+        normalized = query.strip()
+        if not normalized:
+            return []
+
+        try:
+            try:
+                search = yf.Search(normalized, max_results=max_results, news_count=0, timeout=5, raise_errors=False)
+            except TypeError:
+                search = yf.Search(normalized, max_results=max_results, news_count=0)
+        except Exception:
+            logger.exception("yfinance_symbol_search_failed query=%s", normalized)
+            return []
+
+        seen: set[str] = set()
+        results: list[dict[str, str]] = []
+        for quote in getattr(search, "quotes", []) or []:
+            symbol = str(quote.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            name = str(
+                quote.get("shortname")
+                or quote.get("longname")
+                or quote.get("displayName")
+                or quote.get("name")
+                or ""
+            ).strip()
+            exchange = str(quote.get("exchange") or quote.get("exchDisp") or "").strip()
+            label = symbol
+            if name:
+                label = f"{label} - {name}"
+            if exchange:
+                label = f"{label} ({exchange})"
+            results.append({"symbol": symbol, "label": label})
+            seen.add(symbol)
+            if len(results) >= max_results:
+                break
+        return results
 
     @staticmethod
     def _normalize_leg(frame: pd.DataFrame, expiration: str, option_type: str, now: datetime, spot: float) -> pd.DataFrame:

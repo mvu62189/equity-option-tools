@@ -46,10 +46,17 @@ def _infer_tau(chain_frame: pl.DataFrame) -> float:
         return 7.0 / 365.0
 
 
-def _compute_weights(chain_frame: pl.DataFrame) -> np.ndarray:
+def _compute_weights(chain_frame: pl.DataFrame, *, weight_col: str | None = None) -> np.ndarray:
     n = chain_frame.height
     if n == 0:
         return np.array([], dtype=float)
+
+    if weight_col and weight_col in chain_frame.columns:
+        weights = chain_frame[weight_col].to_numpy().astype(float)
+        weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0)
+        w_sum = float(np.sum(weights))
+        if w_sum > 0.0:
+            return weights * (n / w_sum)
 
     if {"bid", "ask"}.issubset(chain_frame.columns):
         bid = chain_frame["bid"].to_numpy().astype(float)
@@ -60,6 +67,19 @@ def _compute_weights(chain_frame: pl.DataFrame) -> np.ndarray:
         if w_sum > 0:
             return w * (n / w_sum)
     return np.ones(n, dtype=float)
+
+
+def _resolve_vol_col(chain_frame: pl.DataFrame, requested: str | None) -> str:
+    candidates: list[str] = []
+    if requested:
+        candidates.append(requested)
+    for name in ("implied_vol_input", "iv_ref", "implied_vol", "implied_vol_vendor"):
+        if name not in candidates:
+            candidates.append(name)
+    for candidate in candidates:
+        if candidate in chain_frame.columns:
+            return candidate
+    raise KeyError("no volatility column available for SSVI calibration")
 
 
 def _coordinate(strikes: np.ndarray, forward: float, fit_space: FitSpace) -> np.ndarray:
@@ -97,18 +117,21 @@ def calibrate_ssvi(
     fit_space: FitSpace = "log",
     rate: float = 0.0,
     dividend: float = 0.0,
+    vol_col: str = "implied_vol_input",
+    weight_col: str | None = None,
 ) -> SSVIResult:
     constraints = constraints or SSVIConstraints()
 
     strikes = chain_frame["strike"].to_numpy().astype(float)
-    vols = chain_frame["implied_vol_vendor"].to_numpy().astype(float)
+    resolved_vol_col = _resolve_vol_col(chain_frame, vol_col)
+    vols = chain_frame[resolved_vol_col].to_numpy().astype(float)
     spot = float(chain_frame["underlying_price"][0])
     tau = _infer_tau(chain_frame)
 
     forward = spot * math.exp((rate - dividend) * tau)
     coord = _coordinate(strikes, forward=forward, fit_space=fit_space)
     target_w = np.maximum(vols, 1e-8) ** 2 * tau
-    weights = _compute_weights(chain_frame)
+    weights = _compute_weights(chain_frame, weight_col=weight_col)
 
     base = DEFAULT_INIT.copy()
     if init_guess:
@@ -182,6 +205,8 @@ def calibrate_ssvi_cpp(
     constraints: SSVIConstraints | None = None,
     rate: float = 0.0,
     dividend: float = 0.0,
+    vol_col: str = "implied_vol_input",
+    weight_col: str | None = None,
 ) -> tuple[SSVIResult, dict[str, object]]:
     if quantcore is None:
         raise RuntimeError("quantcore module not available")
@@ -190,10 +215,12 @@ def calibrate_ssvi_cpp(
 
     constraints = constraints or SSVIConstraints()
     strikes = chain_frame["strike"].to_numpy().astype(float)
-    vols = chain_frame["implied_vol_vendor"].to_numpy().astype(float)
+    resolved_vol_col = _resolve_vol_col(chain_frame, vol_col)
+    vols = chain_frame[resolved_vol_col].to_numpy().astype(float)
     spot = float(chain_frame["underlying_price"][0])
     tau = _infer_tau(chain_frame)
     forward = spot * math.exp((rate - dividend) * tau)
+    weights = _compute_weights(chain_frame, weight_col=weight_col)
 
     guess = dict(init_guess or {})
     if not guess:
@@ -209,6 +236,7 @@ def calibrate_ssvi_cpp(
     payload = quantcore.calibrate_ssvi_log_slice(
         strikes.tolist(),
         vols.tolist(),
+        weights.tolist(),
         float(forward),
         float(tau),
         guess,

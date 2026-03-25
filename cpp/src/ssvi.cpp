@@ -43,6 +43,7 @@ inline std::vector<double> to_log_moneyness(
 inline double ssvi_sse(
     const std::vector<double>& x,
     const std::vector<double>& target_w,
+    const std::vector<double>& weights,
     double tau,
     double a,
     double b,
@@ -56,7 +57,8 @@ inline double ssvi_sse(
     const double xm = x[i] - m;
     const double w = a + b * (rho * xm + std::sqrt(xm * xm + sig * sig));
     const double diff = w - target_w[i];
-    sse += diff * diff;
+    const double weight = (i < weights.size() && std::isfinite(weights[i]) && weights[i] > 0.0) ? weights[i] : 1.0;
+    sse += weight * diff * diff;
   }
   return sse;
 }
@@ -75,6 +77,7 @@ inline double median_forward_guess(const std::vector<double>& strikes) {
 SsviCalibrationResult calibrate_ssvi_log_slice(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
+    const std::vector<double>& weights,
     double forward,
     double tau,
     const std::map<std::string, double>& init_guess,
@@ -98,6 +101,10 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
   }
   if (strikes.size() != ivs.size()) {
     out.reason = "size_mismatch";
+    return out;
+  }
+  if (!weights.empty() && weights.size() != strikes.size()) {
+    out.reason = "weight_size_mismatch";
     return out;
   }
   if (!finite_vec(strikes) || !finite_vec(ivs)) {
@@ -135,7 +142,27 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
   double m = clamp(out.m, m_lo, m_hi);
   double sigma = clamp(out.sigma, sig_lo, sig_hi);
 
-  double best = ssvi_sse(x, target_w, tau_eff, a, b, rho, m, sigma);
+  std::vector<double> use_weights = weights;
+  if (use_weights.empty()) {
+    use_weights.assign(strikes.size(), 1.0);
+  }
+  double weight_sum = 0.0;
+  for (double& value : use_weights) {
+    if (!std::isfinite(value) || value <= 0.0) {
+      value = 0.0;
+    }
+    weight_sum += value;
+  }
+  if (weight_sum <= 0.0) {
+    use_weights.assign(strikes.size(), 1.0);
+    weight_sum = static_cast<double>(use_weights.size());
+  }
+  const double scale = static_cast<double>(use_weights.size()) / std::max(weight_sum, 1e-12);
+  for (double& value : use_weights) {
+    value *= scale;
+  }
+
+  double best = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
   double prev_best = best;
   std::vector<double> step = {0.08, 0.10, 0.04, 0.10, 0.08};
 
@@ -176,11 +203,11 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
 
       const double up = clamp(base + step[p], lo, hi);
       *var = up;
-      const double sse_up = ssvi_sse(x, target_w, tau_eff, a, b, rho, m, sigma);
+      const double sse_up = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
 
       const double dn = clamp(base - step[p], lo, hi);
       *var = dn;
-      const double sse_dn = ssvi_sse(x, target_w, tau_eff, a, b, rho, m, sigma);
+      const double sse_dn = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
 
       *var = base;
       if (sse_up < best && sse_up <= sse_dn) {
@@ -230,6 +257,7 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
 std::map<std::string, double> calibrate_ssvi(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
+    const std::vector<double>& weights,
     const std::map<std::string, double>& init_guess) {
   const double forward = median_forward_guess(strikes);
   const double tau = 1.0;
@@ -237,7 +265,7 @@ std::map<std::string, double> calibrate_ssvi(
       {"max_iter", 120.0},
       {"tol", 1e-9},
   };
-  const auto fit = calibrate_ssvi_log_slice(strikes, ivs, forward, tau, init_guess, constraints);
+  const auto fit = calibrate_ssvi_log_slice(strikes, ivs, weights, forward, tau, init_guess, constraints);
   return {
       {"a", fit.a},
       {"b", fit.b},

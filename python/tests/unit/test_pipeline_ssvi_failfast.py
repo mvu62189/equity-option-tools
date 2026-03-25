@@ -18,20 +18,20 @@ async def test_primary_log_ssvi_failure_marks_status_and_caches_diagnostics(
 ) -> None:
     frame = pl.DataFrame(
         {
-            "symbol": ["SPY", "SPY"],
-            "asof_ts": [datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc)],
-            "expiration": [date(2026, 1, 31)] * 2,
-            "option_type": ["call", "put"],
-            "strike": [450.0, 450.0],
-            "bid": [1.0, 1.0],
-            "ask": [1.2, 1.2],
-            "last": [1.1, 1.1],
-            "volume": [10, 10],
-            "open_interest": [100, 100],
-            "underlying_price": [449.0, 449.0],
-            "implied_vol_vendor": [0.2, 0.2],
-            "provider": ["test", "test"],
-            "snapshot_id": ["x", "x"],
+            "symbol": ["SPY", "SPY", "SPY"],
+            "asof_ts": [datetime(2026, 1, 1, tzinfo=timezone.utc)] * 3,
+            "expiration": [date(2026, 1, 31)] * 3,
+            "option_type": ["call", "call", "call"],
+            "strike": [440.0, 450.0, 460.0],
+            "bid": [12.0, 8.5, 5.5],
+            "ask": [12.4, 8.9, 5.9],
+            "last": [12.2, 8.7, 5.7],
+            "volume": [10, 10, 10],
+            "open_interest": [100, 100, 100],
+            "underlying_price": [449.0, 449.0, 449.0],
+            "implied_vol_vendor": [0.2, 0.2, 0.2],
+            "provider": ["test", "test", "test"],
+            "snapshot_id": ["x", "x", "x"],
         }
     )
 
@@ -66,7 +66,7 @@ async def test_primary_log_ssvi_failure_marks_status_and_caches_diagnostics(
     assert bool(snapshot.status.get("ssvi_fail")) is True
     diagnostics = service.cache.get_calibration_diagnostics_nowait("SPY")
     assert diagnostics.height >= 1
-    assert "ssvi_primary_log" in diagnostics["model_id"].to_list()
+    assert any(str(mid).startswith("ssvi_call_") for mid in diagnostics["model_id"].to_list())
 
 
 @pytest.mark.asyncio

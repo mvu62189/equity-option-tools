@@ -2,6 +2,9 @@ runtime_mode: "live_strict"
 live_poll_seconds: 5
 live_expiry_scope: "0-30d"
 live_selected_expiries: []
+live_focus_labels: ["0DTE", "1DTE", "EOW"]
+live_hot_poll_seconds: 15
+live_full_snapshot_poll_seconds: 300
 snapshot_eod_time: "20:00"
 snapshot_timezone: "America/New_York"
 market_close_freeze_time: "17:00"

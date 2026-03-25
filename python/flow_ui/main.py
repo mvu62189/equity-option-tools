@@ -4,9 +4,9 @@ import logging
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,11 +18,16 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QSpinBox,
     QTableView,
     QTabWidget,
     QVBoxLayout,
@@ -33,8 +38,17 @@ from flow_core.orchestration.cache import InMemoryQuoteCache
 from flow_core.orchestration.state_store import SymbolSnapshot
 from flow_core.quant import scan_arbitrage_violations
 from flow_ui.state_bridge import UIStateBridge
+from flow_ui.page_payload_cache import PagePayloadCache
+from flow_ui.symbol_controls import SymbolExpirationControls, configure_expiration_combo
 from flow_ui.update_coordinator import UpdateCoordinator
-from flow_ui.viewmodels import build_price_error_payload
+from flow_ui.viewmodels import (
+    build_short_expiry_scanner_payload,
+    build_calendar_payload,
+    build_density_payload,
+    build_price_error_payload,
+    build_runtime_metrics_payload,
+    build_surface_validation_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +58,17 @@ class UIState:
     symbol: str = "SPY"
     health: str = "idle"
     last_version: int = 0
+
+
+@dataclass(slots=True)
+class LineVisibilityControl:
+    title: str
+    widget: QWidget
+    label: QLabel
+    grid_host: QWidget
+    grid_layout: QGridLayout
+    checkboxes: dict[str, QCheckBox] = field(default_factory=dict)
+    hidden_keys: set[str] = field(default_factory=set)
 
 
 ROUTED_GREEKS_COLUMN_HELP: dict[str, str] = {
@@ -127,12 +152,23 @@ class MainWindow(QMainWindow):
         market_close_freeze_time: str = "17:00",
         final_prices_refresh_time: str = "17:30",
         oi_refresh_time: str = "20:30",
+        session_config: dict[str, Any] | None = None,
+        runtime_summary: dict[str, Any] | None = None,
+        session_save_callback: Callable[[dict[str, Any]], str] | None = None,
+        bootstrap_message: str | None = None,
+        symbol_search_callback: Callable[[str], list[dict[str, str]]] | None = None,
+        expiration_lookup_callback: Callable[[str], list[str]] | None = None,
+        live_expiration: str | None = None,
+        live_expiration_setter: Callable[[str | None], None] | None = None,
+        live_expiration_enabled: bool = False,
+        live_runtime_status_callback: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         super().__init__()
         self._cache = cache
         self._state = UIState(symbol=symbol)
         self._bridge = bridge or UIStateBridge(max_pending_per_symbol=1)
         self._coordinator = UpdateCoordinator()
+        self._page_payload_cache = PagePayloadCache(max_entries=96)
         self._refresh_callback = refresh_callback
         self._history_callback = history_callback
         self._dirty_symbols: set[str] = set()
@@ -146,6 +182,16 @@ class MainWindow(QMainWindow):
         self._final_prices_refresh_time = final_prices_refresh_time
         self._oi_refresh_time = oi_refresh_time
         self._time_series_frame = None
+        self._session_config = dict(session_config or {})
+        self._runtime_summary = dict(runtime_summary or {})
+        self._session_save_callback = session_save_callback
+        self._bootstrap_message = (bootstrap_message or "").strip()
+        self._symbol_search_callback = symbol_search_callback
+        self._expiration_lookup_callback = expiration_lookup_callback
+        self._live_expiration_setter = live_expiration_setter
+        self._live_expiration_enabled = bool(live_expiration_enabled)
+        self._live_runtime_status_callback = live_runtime_status_callback
+        self._scanner_selected_focus_label = "0DTE"
 
         self._cache.set_update_callback(self._bridge.coalesce)
         self._bridge.snapshot_ready.connect(self._on_snapshot_ready)
@@ -155,16 +201,142 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
 
-        self._live_label = QLabel("Live monitor: waiting for data")
-        self._snapshot_status = QLabel("Snapshot status: waiting for data")
+        initial_live_text = (
+            "Live monitor: waiting for first live batch" if self._live_expiration_enabled else "Live monitor: waiting for data"
+        )
+        if self._bootstrap_message == "no stored snapshot found" and self._live_expiration_enabled:
+            initial_snapshot_text = "Snapshot status: no stored snapshot found yet; waiting for the first live batch"
+        elif self._bootstrap_message:
+            initial_snapshot_text = f"Snapshot status: {self._bootstrap_message}"
+        else:
+            initial_snapshot_text = "Snapshot status: waiting for data"
+        self._live_label = QLabel(initial_live_text)
+        self._snapshot_status = QLabel(initial_snapshot_text)
+        self._live_expiration = QComboBox()
+        self._live_expiration.currentIndexChanged.connect(self._on_live_expiration_changed)
+        self._live_expiration_status = QLabel(
+            "Live expiry: choose one expiry or leave Auto to follow the configured live scope."
+        )
+        self._live_runtime_status = QLabel("Live runtime: waiting for the first status update")
         self._refresh_button = QPushButton("Refresh Latest Snapshot")
         self._refresh_button.setText(self._refresh_button_text())
         self._refresh_button.clicked.connect(self._refresh_latest_snapshot)
         live_page = QWidget()
         live_layout = QVBoxLayout(live_page)
+        live_controls = QHBoxLayout()
+        live_controls.addWidget(QLabel("Live Expiry"))
+        live_controls.addWidget(self._live_expiration)
+        live_controls.addStretch(1)
+        live_layout.addLayout(live_controls)
+        live_layout.addWidget(self._live_expiration_status)
+        live_layout.addWidget(self._live_runtime_status)
         live_layout.addWidget(self._live_label)
         live_layout.addWidget(self._snapshot_status)
         live_layout.addWidget(self._refresh_button)
+        self._configure_live_expiration_controls(symbol, live_expiration)
+
+        self._scanner_status = QLabel("SPY Short Expiry Scanner: waiting for focused expiry diagnostics")
+        self._scanner_runtime_badge = QLabel("Scanner runtime: waiting for first batch")
+        self._scanner_explain = QLabel(
+            "Scanner is the landing page for SPY 0DTE, 1DTE, and EOW. Click an expiry card to sync the drilldown tabs "
+            "without changing the live polling selection."
+        )
+        self._scanner_explain.setWordWrap(True)
+        self._scanner_focus_buttons: dict[str, QPushButton] = {}
+        scanner_cards = QHBoxLayout()
+        for focus_label in ("0DTE", "1DTE", "EOW"):
+            button = QPushButton(f"{focus_label}\nWaiting for data")
+            button.setCheckable(True)
+            button.setMinimumHeight(88)
+            button.clicked.connect(
+                lambda _checked, label=focus_label: self._on_scanner_focus_card_clicked(label)
+            )
+            self._scanner_focus_buttons[focus_label] = button
+            scanner_cards.addWidget(button)
+        scanner_cards.addStretch(1)
+        self._scanner_heat_plot = pg.PlotWidget()
+        self._scanner_heat_plot.setBackground("w")
+        self._scanner_heat_plot.setLabel("bottom", "Strike")
+        self._scanner_heat_plot.setLabel("left", "Focus Expiry")
+        self._scanner_heat_img = pg.ImageItem()
+        self._scanner_heat_plot.addItem(self._scanner_heat_img)
+        self._scanner_color_bar = pg.ColorBarItem(label="Gamma OI Exposure", colorMap="CET-D1A")
+        self._scanner_color_bar.setImageItem(self._scanner_heat_img)
+        self._scanner_summary_model = PolarsTableModel()
+        scanner_summary_table = QTableView()
+        scanner_summary_table.setModel(self._scanner_summary_model)
+        self._scanner_levels_model = PolarsTableModel()
+        scanner_levels_table = QTableView()
+        scanner_levels_table.setModel(self._scanner_levels_model)
+        self._scanner_flow_model = PolarsTableModel()
+        scanner_flow_table = QTableView()
+        scanner_flow_table.setModel(self._scanner_flow_model)
+        scanner_page = QWidget()
+        scanner_layout = QVBoxLayout(scanner_page)
+        scanner_layout.addWidget(self._scanner_status)
+        scanner_layout.addWidget(self._scanner_runtime_badge)
+        scanner_layout.addWidget(self._scanner_explain)
+        scanner_layout.addLayout(scanner_cards)
+        scanner_layout.addWidget(self._scanner_heat_plot)
+        scanner_layout.addWidget(QLabel("Focused Expiry Summary"))
+        scanner_layout.addWidget(scanner_summary_table)
+        scanner_layout.addWidget(QLabel("Scanner Levels"))
+        scanner_layout.addWidget(scanner_levels_table)
+        scanner_layout.addWidget(QLabel("Flow Proxies"))
+        scanner_layout.addWidget(scanner_flow_table)
+
+        self._run_mode = QComboBox()
+        self._run_mode.addItems(["ui_review", "ui_live", "headless_live", "snapshot_once"])
+        self._run_mode.setCurrentText(str(self._session_config.get("mode", "ui_review")))
+        self._run_symbol_controls = SymbolExpirationControls(
+            ticker=str(self._session_config.get("ticker", symbol)),
+            expiration=str(self._session_config.get("expiration", "") or "") or None,
+            search_callback=self._symbol_search_callback,
+            expiration_lookup_callback=self._expiration_lookup_callback,
+        )
+        self._run_mode.currentTextChanged.connect(self._run_symbol_controls.set_mode)
+        self._run_refresh_ms = QSpinBox()
+        self._run_refresh_ms.setRange(10, 60_000)
+        self._run_refresh_ms.setSingleStep(25)
+        self._run_refresh_ms.setValue(int(self._session_config.get("refresh_ms", refresh_ms) or refresh_ms))
+        self._run_allow_shared = QCheckBox("Allow shared stream lock")
+        self._run_allow_shared.setChecked(bool(self._session_config.get("allow_shared", False)))
+        self._run_provider_config = QLineEdit(str(self._session_config.get("provider_config", "")))
+        self._run_pipeline_config = QLineEdit(str(self._session_config.get("pipeline_config", "")))
+        self._run_config_status = QLabel(
+            "Run Config: topology changes are saved for the next launch. Refresh interval can be applied now."
+        )
+        self._run_runtime_summary = QLabel(self._runtime_summary_text())
+        self._run_runtime_summary.setWordWrap(True)
+        run_note = QLabel(
+            "This panel replaces IDE-only launch customization. Use it to inspect the active runtime contract, "
+            "hot-apply the UI refresh interval, and save the next startup session without editing repo defaults."
+        )
+        run_note.setWordWrap(True)
+        run_form = QFormLayout()
+        run_form.addRow("Next-Launch Mode", self._run_mode)
+        run_form.addRow("Next-Launch Ticker", self._run_symbol_controls.ticker_input)
+        run_form.addRow("Next-Launch Expiration", self._run_symbol_controls.expiration_combo)
+        run_form.addRow("UI Refresh (ms)", self._run_refresh_ms)
+        run_form.addRow("", self._run_allow_shared)
+        run_form.addRow("Provider Config", self._run_provider_config)
+        run_form.addRow("Pipeline Config", self._run_pipeline_config)
+        self._run_symbol_controls.set_mode(self._run_mode.currentText())
+        self._apply_display_button = QPushButton("Apply Refresh Now")
+        self._apply_display_button.clicked.connect(self._apply_display_settings)
+        self._save_session_button = QPushButton("Save Session For Next Launch")
+        self._save_session_button.clicked.connect(self._save_session_settings)
+        run_buttons = QHBoxLayout()
+        run_buttons.addWidget(self._apply_display_button)
+        run_buttons.addWidget(self._save_session_button)
+        run_buttons.addStretch(1)
+        run_page = QWidget()
+        run_layout = QVBoxLayout(run_page)
+        run_layout.addWidget(run_note)
+        run_layout.addLayout(run_form)
+        run_layout.addWidget(self._run_runtime_summary)
+        run_layout.addWidget(self._run_config_status)
+        run_layout.addLayout(run_buttons)
 
         self._iv_label = QLabel("IV/term structure: no samples yet")
         self._ssvi_model = PolarsTableModel()
@@ -252,6 +424,8 @@ class MainWindow(QMainWindow):
         self._overlay_line_plot.setLabel("bottom", "Strike")
         self._overlay_line_plot.setLabel("left", "Greek")
         overlay_layout.addWidget(self._overlay_line_plot)
+        self._overlay_line_visibility = self._make_line_visibility_control("Visible Overlay Lines")
+        overlay_layout.addWidget(self._overlay_line_visibility.widget)
 
         self._overlay_heat_plot = pg.PlotWidget()
         self._overlay_heat_plot.setBackground("w")
@@ -341,12 +515,14 @@ class MainWindow(QMainWindow):
         self._price_error_plot.setLabel("left", "Price")
         self._price_error_plot.addLegend(offset=(10, 10))
         self._price_error_line_items: dict[str, pg.PlotDataItem] = {}
+        self._price_error_line_visibility = self._make_line_visibility_control("Visible Price Lines")
         self._price_error_delta_plot = pg.PlotWidget()
         self._price_error_delta_plot.setBackground("w")
         self._price_error_delta_plot.setLabel("bottom", "Strike")
         self._price_error_delta_plot.setLabel("left", "Error")
         self._price_error_delta_plot.addLegend(offset=(10, 10))
         self._price_error_delta_items: dict[str, pg.PlotDataItem] = {}
+        self._price_error_delta_visibility = self._make_line_visibility_control("Visible Error Lines")
         price_controls = QHBoxLayout()
         price_controls.addWidget(QLabel("Expiry"))
         price_controls.addWidget(self._price_error_expiry)
@@ -361,13 +537,157 @@ class MainWindow(QMainWindow):
         price_layout.addWidget(self._price_error_status)
         price_layout.addWidget(self._price_error_explain)
         price_layout.addWidget(self._price_error_plot)
+        price_layout.addWidget(self._price_error_line_visibility.widget)
         price_layout.addWidget(self._price_error_delta_plot)
+        price_layout.addWidget(self._price_error_delta_visibility.widget)
 
+        self._validation_status = QLabel("Validation Workspace: waiting for surface diagnostics")
+        self._validation_explain = QLabel(
+            "Slice Explorer and Surface Explorer use persisted surface diagnostics from the latest batch."
+        )
+        self._validation_explain.setWordWrap(True)
+        self._validation_metric = QComboBox()
+        self._validation_metric.addItems(
+            [
+                "implied_vol",
+                "price",
+                "iv_bid",
+                "iv_ask",
+                "iv_ref",
+                "vendor_iv_ref",
+                "american_model_price",
+                "dual_delta_bid",
+                "dual_delta_ask",
+                "dual_delta_ref",
+                "price_second_derivative_ref",
+                "delta",
+                "gamma",
+                "theta",
+                "vega",
+                "rho",
+                "vol_error_abs",
+                "price_error_abs",
+            ]
+        )
+        self._validation_metric.currentIndexChanged.connect(self._refresh_validation_view)
+        self._validation_option = QComboBox()
+        self._validation_option.addItems(["call", "put", "all"])
+        self._validation_option.currentIndexChanged.connect(self._refresh_validation_view)
+        self._validation_expiry = QComboBox()
+        self._validation_expiry.currentIndexChanged.connect(self._refresh_validation_view)
+        self._validation_line_plot = pg.PlotWidget()
+        self._validation_line_plot.setBackground("w")
+        self._validation_line_plot.setLabel("bottom", "Strike")
+        self._validation_line_plot.setLabel("left", "Metric")
+        self._validation_line_plot.addLegend(offset=(10, 10))
+        self._validation_line_items: dict[str, pg.PlotDataItem] = {}
+        self._validation_line_visibility = self._make_line_visibility_control("Visible Slice Lines")
+        self._validation_heat_plot = pg.PlotWidget()
+        self._validation_heat_plot.setBackground("w")
+        self._validation_heat_plot.setLabel("bottom", "Strike")
+        self._validation_heat_plot.setLabel("left", "Days To Expiry")
+        self._validation_heat_img = pg.ImageItem()
+        self._validation_heat_plot.addItem(self._validation_heat_img)
+        self._validation_color_bar = pg.ColorBarItem(label="Validation Metric", colorMap="CET-L4")
+        self._validation_color_bar.setImageItem(self._validation_heat_img)
+        self._surface_summary_model = PolarsTableModel()
+        surface_summary_table = QTableView()
+        surface_summary_table.setModel(self._surface_summary_model)
+        validation_controls = QHBoxLayout()
+        validation_controls.addWidget(QLabel("Metric"))
+        validation_controls.addWidget(self._validation_metric)
+        validation_controls.addWidget(QLabel("Option Type"))
+        validation_controls.addWidget(self._validation_option)
+        validation_controls.addWidget(QLabel("Expiry"))
+        validation_controls.addWidget(self._validation_expiry)
+        validation_controls.addStretch(1)
+        validation_page = QWidget()
+        validation_layout = QVBoxLayout(validation_page)
+        validation_layout.addLayout(validation_controls)
+        validation_layout.addWidget(self._validation_status)
+        validation_layout.addWidget(self._validation_explain)
+        validation_layout.addWidget(self._validation_line_plot)
+        validation_layout.addWidget(self._validation_line_visibility.widget)
+        validation_layout.addWidget(self._validation_heat_plot)
+        validation_layout.addWidget(surface_summary_table)
+
+        self._calendar_status = QLabel("Calendar / Density: waiting for surface diagnostics")
+        self._calendar_explain = QLabel(
+            "Calendar Inspector shows total variance across strike and expiry; density uses latest-batch model prices."
+        )
+        self._calendar_explain.setWordWrap(True)
+        self._calendar_option = QComboBox()
+        self._calendar_option.addItems(["call", "put", "all"])
+        self._calendar_option.currentIndexChanged.connect(self._refresh_calendar_density_view)
+        self._density_expiry = QComboBox()
+        self._density_expiry.currentIndexChanged.connect(self._refresh_calendar_density_view)
+        calendar_controls = QHBoxLayout()
+        calendar_controls.addWidget(QLabel("Option Type"))
+        calendar_controls.addWidget(self._calendar_option)
+        calendar_controls.addWidget(QLabel("Density Expiry"))
+        calendar_controls.addWidget(self._density_expiry)
+        calendar_controls.addStretch(1)
+        self._calendar_heat_plot = pg.PlotWidget()
+        self._calendar_heat_plot.setBackground("w")
+        self._calendar_heat_plot.setLabel("bottom", "Strike")
+        self._calendar_heat_plot.setLabel("left", "Days To Expiry")
+        self._calendar_heat_img = pg.ImageItem()
+        self._calendar_heat_plot.addItem(self._calendar_heat_img)
+        self._calendar_color_bar = pg.ColorBarItem(label="Total Variance", colorMap="CET-L4")
+        self._calendar_color_bar.setImageItem(self._calendar_heat_img)
+        self._density_plot = pg.PlotWidget()
+        self._density_plot.setBackground("w")
+        self._density_plot.setLabel("bottom", "Strike")
+        self._density_plot.setLabel("left", "Density")
+        self._density_plot.addLegend(offset=(10, 10))
+        self._density_items: dict[str, pg.PlotDataItem] = {}
+        self._density_visibility = self._make_line_visibility_control("Visible Density Lines")
+        self._calendar_violation_model = PolarsTableModel()
+        calendar_violation_table = QTableView()
+        calendar_violation_table.setModel(self._calendar_violation_model)
+        calendar_page = QWidget()
+        calendar_layout = QVBoxLayout(calendar_page)
+        calendar_layout.addLayout(calendar_controls)
+        calendar_layout.addWidget(self._calendar_status)
+        calendar_layout.addWidget(self._calendar_explain)
+        calendar_layout.addWidget(self._calendar_heat_plot)
+        calendar_layout.addWidget(self._density_plot)
+        calendar_layout.addWidget(self._density_visibility.widget)
+        calendar_layout.addWidget(calendar_violation_table)
+
+        self._runtime_metrics_status = QLabel("Runtime Metrics: waiting for latency samples")
+        self._runtime_metrics_explain = QLabel(
+            "Runtime metrics show stage-level latency trends and the latest persisted batch metrics."
+        )
+        self._runtime_metrics_explain.setWordWrap(True)
+        self._runtime_metrics_plot = pg.PlotWidget()
+        self._runtime_metrics_plot.setBackground("w")
+        self._runtime_metrics_plot.setLabel("bottom", "Recent Batch Index")
+        self._runtime_metrics_plot.setLabel("left", "Latency (ms)")
+        self._runtime_metrics_plot.addLegend(offset=(10, 10))
+        self._runtime_metric_items: dict[str, pg.PlotDataItem] = {}
+        self._runtime_metric_visibility = self._make_line_visibility_control("Visible Metric Lines")
+        self._runtime_metrics_model = PolarsTableModel()
+        runtime_metrics_table = QTableView()
+        runtime_metrics_table.setModel(self._runtime_metrics_model)
+        runtime_page = QWidget()
+        runtime_layout = QVBoxLayout(runtime_page)
+        runtime_layout.addWidget(self._runtime_metrics_status)
+        runtime_layout.addWidget(self._runtime_metrics_explain)
+        runtime_layout.addWidget(self._runtime_metrics_plot)
+        runtime_layout.addWidget(self._runtime_metric_visibility.widget)
+        runtime_layout.addWidget(runtime_metrics_table)
+
+        tabs.addTab(scanner_page, "Short Expiry Scanner")
+        tabs.addTab(run_page, "Run Config")
         tabs.addTab(live_page, "Live Chain")
         tabs.addTab(iv_page, "SSVI vs Baseline")
         tabs.addTab(greeks_page, "Routed Greeks")
         tabs.addTab(overlay_page, "Greeks Overlay")
         tabs.addTab(price_page, "Model vs Market")
+        tabs.addTab(validation_page, "Validation Workspace")
+        tabs.addTab(calendar_page, "Calendar / Density")
+        tabs.addTab(runtime_page, "Runtime Metrics")
         tabs.addTab(temporal_page, "Temporal Greeks")
         tabs.addTab(arb_page, "Arbitrage Scanner")
         tabs.addTab(diag_page, "Routing & Parity")
@@ -393,6 +713,7 @@ class MainWindow(QMainWindow):
     def _apply_pending_updates(self) -> None:
         started = time.perf_counter()
         self._refresh_button.setText(self._refresh_button_text())
+        self._refresh_live_runtime_status()
         if self._state.symbol not in self._dirty_symbols:
             return
         version = self._bridge.consume_latest(self._state.symbol)
@@ -421,7 +742,9 @@ class MainWindow(QMainWindow):
 
     def _apply_snapshot(self, snapshot: SymbolSnapshot) -> None:
         frame = snapshot.raw
+        self._page_payload_cache.bind_batch(snapshot.batch_id)
         if frame.is_empty():
+            self._page_payload_cache.clear()
             self._live_label.setText("Live monitor: no rows in cache")
             self._snapshot_status.setText("Snapshot status: no cached snapshot")
             self._iv_label.setText("IV/term structure: no rows in cache")
@@ -437,6 +760,19 @@ class MainWindow(QMainWindow):
             self._routing_label.setText("Routing: no diagnostics yet")
             self._temporal_status.setText("Temporal Greeks: no routed Greeks history")
             self._price_error_status.setText("Model vs Market: no routed Greeks in cache")
+            self._validation_status.setText("Validation Workspace: no surface diagnostics in cache")
+            self._calendar_status.setText("Calendar / Density: no surface diagnostics in cache")
+            self._runtime_metrics_status.setText("Runtime Metrics: no metrics in cache")
+            self._scanner_status.setText("SPY Short Expiry Scanner: no focused expiry diagnostics in cache")
+            self._scanner_runtime_badge.setText("Scanner runtime: waiting for first batch")
+            self._scanner_summary_model.update([["No scanner summary"]], ["status"])
+            self._scanner_levels_model.update([["No scanner levels"]], ["status"])
+            self._scanner_flow_model.update([["No proxy flow diagnostics"]], ["status"])
+            self._sync_scanner_focus_cards(pl.DataFrame(), self._scanner_selected_focus_label)
+            self._scanner_heat_img.setImage(np.ascontiguousarray(np.zeros((1, 1), dtype=np.float32)), autoLevels=False)
+            self._scanner_heat_img.setRect(QRectF(0.0, 0.0, 1.0, 1.0))
+            self._scanner_heat_img.setLevels((0.0, 1.0))
+            self._scanner_color_bar.setLevels((0.0, 1.0))
             return
 
         self._live_label.setText(
@@ -511,7 +847,6 @@ class MainWindow(QMainWindow):
             use_cols = [c for c in show_cols if c in greeks.columns]
             self._greeks_model.update(greeks.select(use_cols).head(120).rows(), use_cols, ROUTED_GREEKS_COLUMN_HELP)
             self._refresh_expiry_options(greeks)
-            self._refresh_price_error_controls(greeks)
             self._refresh_temporal_controls()
             self._coordinator.request_overlay(
                 snapshot,
@@ -522,7 +857,6 @@ class MainWindow(QMainWindow):
                 engine_mask=self._selected_engine_mask(),
                 dual_mode=bool(self._overlay_dual_mode.isChecked()),
             )
-            self._refresh_price_error_plot()
 
         if all(c in frame.columns for c in ("bid", "ask", "strike", "option_type")):
             violations = scan_arbitrage_violations(frame)
@@ -572,6 +906,15 @@ class MainWindow(QMainWindow):
             )
             self._parity_detail_model.update(show.rows(), show.columns)
 
+        self._refresh_price_error_controls()
+        self._refresh_price_error_plot()
+        self._refresh_validation_controls()
+        self._refresh_validation_view()
+        self._refresh_calendar_controls()
+        self._refresh_calendar_density_view()
+        self._refresh_runtime_metrics_view()
+        self._refresh_scanner_view()
+
     def _refresh_expiry_options(self, greeks) -> None:  # noqa: ANN001
         if "expiration" not in greeks.columns:
             return
@@ -586,10 +929,21 @@ class MainWindow(QMainWindow):
         self._overlay_expiry.setCurrentIndex(idx if idx >= 0 else 0)
         self._overlay_expiry.blockSignals(False)
 
-    def _refresh_price_error_controls(self, greeks) -> None:  # noqa: ANN001
-        if "expiration" not in greeks.columns:
+    def _refresh_price_error_controls(self) -> None:
+        frame = self._history_frame("surface_points")
+        if frame.is_empty():
+            snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+            frame = snapshot.greeks if snapshot is not None else pl.DataFrame()
+        if frame.is_empty() or "expiration" not in frame.columns:
             return
-        expiries = sorted({str(x) for x in greeks["expiration"].to_list() if x is not None})
+        latest = frame
+        if "asof_ts" in latest.columns:
+            latest_ts = latest["asof_ts"].max()
+            latest = latest.filter(pl.col("asof_ts") == latest_ts)
+        if "batch_id" in latest.columns and not latest.is_empty():
+            latest_batch = str(latest["batch_id"][-1])
+            latest = latest.filter(pl.col("batch_id").cast(pl.String) == latest_batch)
+        expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
         current = self._price_error_expiry.currentText() if self._price_error_expiry.count() > 0 else ""
         self._price_error_expiry.blockSignals(True)
         self._price_error_expiry.clear()
@@ -598,6 +952,38 @@ class MainWindow(QMainWindow):
         idx = self._price_error_expiry.findText(current)
         self._price_error_expiry.setCurrentIndex(idx if idx >= 0 else 0)
         self._price_error_expiry.blockSignals(False)
+
+    def _refresh_validation_controls(self) -> None:
+        frame = self._history_frame("surface_points")
+        if frame.is_empty() or "expiration" not in frame.columns:
+            self._validation_status.setText("Validation Workspace: no surface diagnostics history")
+            return
+        latest = frame.sort([c for c in ("asof_ts", "batch_id", "expiration") if c in frame.columns]).tail(frame.height)
+        expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
+        current = self._validation_expiry.currentText() if self._validation_expiry.count() > 0 else "all"
+        self._validation_expiry.blockSignals(True)
+        self._validation_expiry.clear()
+        self._validation_expiry.addItem("all")
+        for exp in expiries:
+            self._validation_expiry.addItem(exp)
+        idx = self._validation_expiry.findText(current)
+        self._validation_expiry.setCurrentIndex(idx if idx >= 0 else 0)
+        self._validation_expiry.blockSignals(False)
+
+    def _refresh_calendar_controls(self) -> None:
+        frame = self._history_frame("surface_points")
+        if frame.is_empty() or "expiration" not in frame.columns:
+            self._calendar_status.setText("Calendar / Density: no surface diagnostics history")
+            return
+        expiries = sorted({str(x) for x in frame["expiration"].to_list() if x is not None})
+        current = self._density_expiry.currentText() if self._density_expiry.count() > 0 else ""
+        self._density_expiry.blockSignals(True)
+        self._density_expiry.clear()
+        for exp in expiries:
+            self._density_expiry.addItem(exp)
+        idx = self._density_expiry.findText(current)
+        self._density_expiry.setCurrentIndex(idx if idx >= 0 else 0)
+        self._density_expiry.blockSignals(False)
 
     def _history_frame(self, dataset: str) -> pl.DataFrame:
         history = self._cache.get_history_nowait(self._state.symbol, dataset)
@@ -616,6 +1002,123 @@ class MainWindow(QMainWindow):
         if sort_cols:
             merged = merged.sort(sort_cols)
         return merged
+
+    def _payload_batch_id(self) -> str:
+        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+        return snapshot.batch_id if snapshot is not None else ""
+
+    def _cached_page_payload(
+        self,
+        *,
+        page: str,
+        key: tuple[object, ...],
+        builder: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._page_payload_cache.get_or_build(
+            batch_id=self._payload_batch_id(),
+            page=page,
+            key=key,
+            builder=builder,
+        )
+
+    def _make_line_visibility_control(self, title: str) -> LineVisibilityControl:
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(4)
+        label = QLabel(title)
+        label.setWordWrap(True)
+        panel_layout.addWidget(label)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMaximumHeight(88)
+        grid_host = QWidget()
+        grid_layout = QGridLayout(grid_host)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setHorizontalSpacing(12)
+        grid_layout.setVerticalSpacing(4)
+        scroll.setWidget(grid_host)
+        panel_layout.addWidget(scroll)
+        panel.setVisible(False)
+        return LineVisibilityControl(
+            title=title,
+            widget=panel,
+            label=label,
+            grid_host=grid_host,
+            grid_layout=grid_layout,
+        )
+
+    def _on_line_visibility_changed(
+        self,
+        control: LineVisibilityControl,
+        storage: dict[str, pg.PlotDataItem],
+        series_key: str,
+        state: int,
+    ) -> None:
+        visible = state == Qt.Checked
+        if visible:
+            control.hidden_keys.discard(series_key)
+        else:
+            control.hidden_keys.add(series_key)
+        item = storage.get(series_key)
+        if item is not None:
+            item.setVisible(visible)
+
+    def _sync_line_visibility_controls(
+        self,
+        control: LineVisibilityControl | None,
+        storage: dict[str, pg.PlotDataItem],
+        line_series: dict[str, object],
+    ) -> None:
+        if control is None:
+            return
+
+        incoming = set(line_series.keys())
+        existing = set(control.checkboxes.keys())
+        for key in sorted(existing - incoming):
+            checkbox = control.checkboxes.pop(key)
+            checkbox.deleteLater()
+
+        for key in sorted(incoming):
+            if key not in control.checkboxes:
+                checkbox = QCheckBox(key)
+                checkbox.setToolTip(key)
+                checkbox.setChecked(key not in control.hidden_keys)
+                checkbox.stateChanged.connect(
+                    lambda state, series_key=key, ctl=control, store=storage: self._on_line_visibility_changed(
+                        ctl,
+                        store,
+                        series_key,
+                        state,
+                    )
+                )
+                control.checkboxes[key] = checkbox
+
+            checkbox = control.checkboxes[key]
+            should_show = key not in control.hidden_keys
+            if checkbox.isChecked() != should_show:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(should_show)
+                checkbox.blockSignals(False)
+            item = storage.get(key)
+            if item is not None:
+                item.setVisible(should_show)
+
+        while control.grid_layout.count():
+            grid_item = control.grid_layout.takeAt(0)
+            widget = grid_item.widget()
+            if widget is not None:
+                control.grid_layout.removeWidget(widget)
+
+        for idx, key in enumerate(sorted(control.checkboxes)):
+            row, col = divmod(idx, 2)
+            control.grid_layout.addWidget(control.checkboxes[key], row, col)
+
+        has_series = bool(control.checkboxes)
+        control.label.setText(f"{control.title}: {len(control.checkboxes)} series")
+        control.widget.setVisible(has_series)
 
     def _request_overlay_refresh(self) -> None:
         snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
@@ -683,13 +1186,20 @@ class MainWindow(QMainWindow):
         )
 
     def _update_line_plot(self, line_series: dict[str, object]) -> None:
-        self._update_plot_series(self._overlay_line_plot, self._line_items, line_series)
+        self._update_plot_series(
+            self._overlay_line_plot,
+            self._line_items,
+            line_series,
+            control=self._overlay_line_visibility,
+        )
 
     def _update_plot_series(
         self,
         plot: pg.PlotWidget,
         storage: dict[str, pg.PlotDataItem],
         line_series: dict[str, object],
+        *,
+        control: LineVisibilityControl | None = None,
     ) -> None:
         existing = set(storage.keys())
         incoming = set(line_series.keys())
@@ -712,23 +1222,47 @@ class MainWindow(QMainWindow):
                 storage[key] = item
             item = storage[key]
             item.setData(arr[:, 0], arr[:, 1])
+        self._sync_line_visibility_controls(control, storage, line_series)
 
     def _refresh_price_error_plot(self) -> None:
         snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
-        if snapshot is None or snapshot.greeks.is_empty():
-            self._price_error_status.setText("Model vs Market: no routed Greeks available")
+        surface_points = self._history_frame("surface_points")
+        if (snapshot is None or snapshot.greeks.is_empty()) and surface_points.is_empty():
+            self._price_error_status.setText("Model vs Market: no surface or routed-Greeks data available")
             return
         expiry = self._price_error_expiry.currentText() or "all"
-        payload = build_price_error_payload(
-            snapshot,
-            option_type=self._price_error_option.currentText(),
-            expiry_filter=expiry,
-            engine_mask=self._selected_engine_mask(),
-            relative=self._price_error_mode.currentText() == "relative",
+        relative = self._price_error_mode.currentText() == "relative"
+        engine_mask = self._selected_engine_mask()
+        payload = self._cached_page_payload(
+            page="price_error",
+            key=(
+                self._price_error_option.currentText(),
+                expiry,
+                relative,
+                tuple(sorted(engine_mask)),
+                "surface_points" if not surface_points.is_empty() else "snapshot",
+            ),
+            builder=lambda: build_price_error_payload(
+                surface_points if not surface_points.is_empty() else snapshot,
+                option_type=self._price_error_option.currentText(),
+                expiry_filter=expiry,
+                engine_mask=engine_mask,
+                relative=relative,
+            ),
         )
         meta = payload.get("meta", {})
-        self._update_plot_series(self._price_error_plot, self._price_error_line_items, payload.get("line_series", {}))
-        self._update_plot_series(self._price_error_delta_plot, self._price_error_delta_items, payload.get("error_series", {}))
+        self._update_plot_series(
+            self._price_error_plot,
+            self._price_error_line_items,
+            payload.get("line_series", {}),
+            control=self._price_error_line_visibility,
+        )
+        self._update_plot_series(
+            self._price_error_delta_plot,
+            self._price_error_delta_items,
+            payload.get("error_series", {}),
+            control=self._price_error_delta_visibility,
+        )
         self._price_error_delta_plot.setLabel("left", "Relative Error" if self._price_error_mode.currentText() == "relative" else "Absolute Error")
         self._price_error_explain.setText(
             f"{meta.get('chart_explanation', 'Model-versus-market price comparison.')}"
@@ -738,6 +1272,378 @@ class MainWindow(QMainWindow):
             f"Model vs Market: expiry={expiry} option={self._price_error_option.currentText()} "
             f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}"
         )
+
+    def _refresh_validation_view(self) -> None:
+        frame = self._history_frame("surface_points")
+        payload = self._cached_page_payload(
+            page="validation_workspace",
+            key=(
+                self._validation_metric.currentText(),
+                self._validation_option.currentText(),
+                self._validation_expiry.currentText() or "all",
+            ),
+            builder=lambda: build_surface_validation_payload(
+                frame,
+                metric=self._validation_metric.currentText(),
+                option_type=self._validation_option.currentText(),
+                expiry_filter=self._validation_expiry.currentText() or "all",
+            ),
+        )
+        self._update_plot_series(
+            self._validation_line_plot,
+            self._validation_line_items,
+            payload.get("line_series", {}),
+            control=self._validation_line_visibility,
+        )
+        heat = payload.get("heat_image")
+        rect = payload.get("rect", (0.0, 0.0, 1.0, 1.0))
+        levels = payload.get("levels", (0.0, 1.0))
+        meta = payload.get("meta", {})
+        show_heat = heat is not None and not bool(meta.get("is_single_expiry"))
+        self._validation_heat_plot.setVisible(show_heat)
+        if show_heat:
+            self._validation_heat_img.setImage(heat, autoLevels=False, autoDownsample=True)
+            self._validation_heat_img.setRect(QRectF(*rect))
+            self._validation_heat_img.setLevels(levels)
+            self._validation_color_bar.setLevels(levels)
+            y_ticks = list(zip(meta.get("y_axis_values", []), meta.get("y_axis_labels", [])))
+            if y_ticks:
+                self._validation_heat_plot.getAxis("left").setTicks([y_ticks])
+        self._validation_explain.setText(meta.get("chart_explanation", "Validation workspace."))
+        self._validation_status.setText(
+            f"Validation Workspace: metric={self._validation_metric.currentText()} "
+            f"expiry={meta.get('selected_expiry', self._validation_expiry.currentText() or 'all')} "
+            f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}"
+        )
+
+        summary = self._history_frame("surface_diagnostics")
+        if summary.is_empty():
+            self._surface_summary_model.update([["No surface summary"]], ["status"])
+        else:
+            latest = summary.sort([c for c in ("asof_ts", "batch_id") if c in summary.columns]).tail(1)
+            cols = [
+                c
+                for c in (
+                    "rows",
+                    "price_rmse",
+                    "vol_rmse",
+                    "atm_mae",
+                    "wing_rmse",
+                    "within_bid_ask_ratio",
+                    "american_within_bid_ask_ratio",
+                    "negative_gamma_ratio",
+                    "delta_smoothness_violation_ratio",
+                    "calendar_violation_ratio",
+                    "one_sided_drop_count",
+                    "duplicate_conflict_count",
+                    "strip_shape_fail_count",
+                    "core_eligible_rows",
+                )
+                if c in latest.columns
+            ]
+            self._surface_summary_model.update(latest.select(cols).rows(), cols)
+
+    def _refresh_calendar_density_view(self) -> None:
+        frame = self._history_frame("surface_points")
+        cal_payload = self._cached_page_payload(
+            page="calendar_density_heat",
+            key=(self._calendar_option.currentText(),),
+            builder=lambda: build_calendar_payload(frame, option_type=self._calendar_option.currentText()),
+        )
+        heat = cal_payload.get("heat_image")
+        rect = cal_payload.get("rect", (0.0, 0.0, 1.0, 1.0))
+        levels = cal_payload.get("levels", (0.0, 1.0))
+        meta = cal_payload.get("meta", {})
+        show_heat = heat is not None and not bool(meta.get("is_single_expiry"))
+        self._calendar_heat_plot.setVisible(show_heat)
+        if show_heat:
+            self._calendar_heat_img.setImage(heat, autoLevels=False, autoDownsample=True)
+            self._calendar_heat_img.setRect(QRectF(*rect))
+            self._calendar_heat_img.setLevels(levels)
+            self._calendar_color_bar.setLevels(levels)
+            y_ticks = list(zip(meta.get("y_axis_values", []), meta.get("y_axis_labels", [])))
+            if y_ticks:
+                self._calendar_heat_plot.getAxis("left").setTicks([y_ticks])
+
+        density_payload = self._cached_page_payload(
+            page="calendar_density_line",
+            key=(self._calendar_option.currentText(), self._density_expiry.currentText() or "all"),
+            builder=lambda: build_density_payload(
+                frame,
+                option_type=self._calendar_option.currentText(),
+                expiry_filter=self._density_expiry.currentText() or "all",
+            ),
+        )
+        self._update_plot_series(
+            self._density_plot,
+            self._density_items,
+            density_payload.get("line_series", {}),
+            control=self._density_visibility,
+        )
+        density_meta = density_payload.get("meta", {})
+        self._calendar_explain.setText(
+            f"{meta.get('chart_explanation', 'Calendar diagnostics.')} "
+            f"{density_meta.get('chart_explanation', 'Density diagnostics.')}"
+        )
+        self._calendar_status.setText(
+            f"Calendar / Density: violations={meta.get('violation_count', 0)} "
+            f"density_negatives={density_meta.get('negative_points', 0)} "
+            f"status={meta.get('status', 'ok')}/{density_meta.get('status', 'ok')}"
+        )
+
+        if frame.is_empty():
+            self._calendar_violation_model.update([["No calendar diagnostics"]], ["status"])
+        else:
+            latest = frame.sort([c for c in ("asof_ts", "batch_id") if c in frame.columns]).tail(frame.height)
+            violations = latest.filter(pl.col("calendar_violation") == True) if "calendar_violation" in latest.columns else pl.DataFrame()
+            if violations.is_empty():
+                self._calendar_violation_model.update([["No calendar violations found"]], ["status"])
+            else:
+                cols = [c for c in ("expiration", "option_type", "strike", "calendar_total_variance", "calendar_violation", "is_negative_gamma", "delta_smoothness_violation") if c in violations.columns]
+                self._calendar_violation_model.update(violations.select(cols).head(120).rows(), cols)
+
+    def _refresh_runtime_metrics_view(self) -> None:
+        frame = self._history_frame("runtime_metrics")
+        payload = self._cached_page_payload(
+            page="runtime_metrics",
+            key=(),
+            builder=lambda: build_runtime_metrics_payload(frame),
+        )
+        self._update_plot_series(
+            self._runtime_metrics_plot,
+            self._runtime_metric_items,
+            payload.get("line_series", {}),
+            control=self._runtime_metric_visibility,
+        )
+        meta = payload.get("meta", {})
+        self._runtime_metrics_explain.setText(meta.get("chart_explanation", "Runtime metrics."))
+        self._runtime_metrics_status.setText(
+            f"Runtime Metrics: rows={meta.get('rows', 0)} latest_total_ms={meta.get('latest_total_ms', 0.0):.2f} status={meta.get('status', 'ok')}"
+        )
+        if frame.is_empty():
+            self._runtime_metrics_model.update([["No runtime metrics"]], ["status"])
+            return
+        show_cols = [
+            c
+            for c in (
+                "version",
+                "snapshot_kind",
+                "total_ms",
+                "calibration_ms",
+                "pricing_ms",
+                "routing_ms",
+                "state_bytes_total",
+                "drop_overlay",
+            )
+            if c in frame.columns
+        ]
+        latest_rows = frame.sort([c for c in ("asof_ts", "version") if c in frame.columns]).tail(20)
+        self._runtime_metrics_model.update(latest_rows.select(show_cols).rows(), show_cols)
+
+    def _refresh_scanner_view(self) -> dict[str, Any]:
+        focus_summary = self._history_frame("focus_expiry_summary")
+        dealer_points = self._history_frame("dealer_exposure_points")
+        scanner_levels = self._history_frame("scanner_levels")
+        flow_proxy_points = self._history_frame("flow_proxy_points")
+        payload = self._cached_page_payload(
+            page="short_expiry_scanner",
+            key=(self._scanner_selected_focus_label,),
+            builder=lambda: build_short_expiry_scanner_payload(
+                focus_summary,
+                dealer_points,
+                scanner_levels,
+                flow_proxy_points,
+                selected_focus_label=self._scanner_selected_focus_label,
+            ),
+        )
+        meta = payload.get("meta", {})
+        selected = str(meta.get("selected_focus_label", self._scanner_selected_focus_label) or self._scanner_selected_focus_label)
+        self._scanner_selected_focus_label = selected
+
+        summary_frame = payload.get("summary_frame", pl.DataFrame())
+        levels_frame = payload.get("levels_frame", pl.DataFrame())
+        flow_frame = payload.get("flow_frame", pl.DataFrame())
+        self._sync_scanner_focus_cards(summary_frame, selected)
+
+        heat = payload.get("heat_image")
+        rect = payload.get("rect", (0.0, 0.0, 1.0, 1.0))
+        levels = payload.get("levels", (0.0, 1.0))
+        if heat is not None:
+            self._scanner_heat_img.setImage(heat, autoLevels=False, autoDownsample=True)
+            self._scanner_heat_img.setRect(QRectF(*rect))
+            self._scanner_heat_img.setLevels(levels)
+            self._scanner_color_bar.setLevels(levels)
+        y_ticks = list(zip(meta.get("y_axis_values", []), meta.get("y_axis_labels", [])))
+        if y_ticks:
+            self._scanner_heat_plot.getAxis("left").setTicks([y_ticks])
+
+        if summary_frame.is_empty():
+            self._scanner_summary_model.update([["No focused expiry summary"]], ["status"])
+        else:
+            show_cols = [
+                c
+                for c in (
+                    "focus_label",
+                    "expiration",
+                    "days_to_expiry",
+                    "row_count",
+                    "eligible_ratio",
+                    "within_bid_ask_ratio",
+                    "atm_iv_ref",
+                    "iv_skew_wing_diff",
+                    "volume_sum",
+                    "open_interest_sum",
+                    "trust_status",
+                    "trust_score",
+                    "snapshot_age_sec",
+                )
+                if c in summary_frame.columns
+            ]
+            self._scanner_summary_model.update(summary_frame.select(show_cols).rows(), show_cols)
+
+        if levels_frame.is_empty():
+            self._scanner_levels_model.update([["No scanner levels"]], ["status"])
+        else:
+            show_cols = [
+                c
+                for c in (
+                    "focus_label",
+                    "expiration",
+                    "strike",
+                    "avg_iv_ref",
+                    "avg_market_mid",
+                    "total_volume",
+                    "total_open_interest",
+                    "net_gamma_exposure_oi",
+                    "eligible_ratio",
+                    "within_bid_ask_ratio",
+                    "hotspot_score",
+                )
+                if c in levels_frame.columns
+            ]
+            self._scanner_levels_model.update(levels_frame.select(show_cols).rows(), show_cols)
+
+        if flow_frame.is_empty():
+            self._scanner_flow_model.update([["No proxy flow diagnostics"]], ["status"])
+        else:
+            show_cols = [
+                c
+                for c in (
+                    "focus_label",
+                    "expiration",
+                    "option_type",
+                    "strike",
+                    "delta_volume",
+                    "delta_open_interest",
+                    "delta_avg_market_mid",
+                    "delta_avg_iv_ref",
+                    "delta_gamma_exposure_oi",
+                    "proxy_confidence",
+                    "proxy_reason",
+                )
+                if c in flow_frame.columns
+            ]
+            self._scanner_flow_model.update(flow_frame.select(show_cols).rows(), show_cols)
+
+        runtime_payload = self._live_runtime_status_callback() if self._live_runtime_status_callback is not None else {}
+        runtime_payload = runtime_payload or {}
+        cadence_mode = str(runtime_payload.get("cadence_mode", "n/a"))
+        fetch_scope = str(runtime_payload.get("fetch_scope", "n/a"))
+        hot_seconds = int(runtime_payload.get("cadence_hot_seconds", 0) or 0)
+        full_seconds = int(runtime_payload.get("cadence_full_snapshot_seconds", 0) or 0)
+        runtime_state = str(runtime_payload.get("state", "idle"))
+        self._scanner_runtime_badge.setText(
+            f"Scanner runtime: state={runtime_state} scope={fetch_scope} cadence={cadence_mode} hot={hot_seconds}s full={full_seconds}s"
+        )
+        trust_status = str(meta.get("trust_status", "n/a"))
+        trust_score = float(meta.get("trust_score", float("nan")) or float("nan"))
+        snapshot_age = float(meta.get("snapshot_age_sec", float("nan")) or float("nan"))
+        age_text = f"{snapshot_age:.1f}s" if np.isfinite(snapshot_age) else "n/a"
+        trust_text = f"{trust_score:.1f}" if np.isfinite(trust_score) else "n/a"
+        self._scanner_explain.setText(meta.get("chart_explanation", self._scanner_explain.text()))
+        self._scanner_status.setText(
+            f"SPY Short Expiry Scanner: focus={selected} expiry={meta.get('selected_expiration', 'n/a')} "
+            f"trust={trust_status} score={trust_text} snapshot_age={age_text} status={meta.get('status', 'ok')}"
+        )
+        return payload
+
+    def _on_scanner_focus_card_clicked(self, focus_label: str) -> None:
+        self._scanner_selected_focus_label = focus_label
+        payload = self._refresh_scanner_view()
+        meta = payload.get("meta", {})
+        selected_expiration = str(meta.get("selected_expiration", "") or "")
+        if selected_expiration and selected_expiration.lower() != "n/a":
+            self._apply_scanner_drilldown(selected_expiration)
+
+    def _sync_scanner_focus_cards(self, summary_frame: pl.DataFrame, selected_focus_label: str) -> None:
+        lookup: dict[str, dict[str, object]] = {}
+        if not summary_frame.is_empty() and "focus_label" in summary_frame.columns:
+            for row in summary_frame.to_dicts():
+                lookup[str(row.get("focus_label", ""))] = row
+        for focus_label, button in self._scanner_focus_buttons.items():
+            row = lookup.get(focus_label)
+            is_selected = focus_label == selected_focus_label
+            button.blockSignals(True)
+            button.setChecked(is_selected)
+            button.blockSignals(False)
+            if row is None:
+                button.setEnabled(False)
+                button.setText(f"{focus_label}\nUnavailable")
+                button.setStyleSheet(self._scanner_card_style("unavailable", is_selected))
+                continue
+            button.setEnabled(True)
+            trust_status = str(row.get("trust_status", "review"))
+            trust_score = float(row.get("trust_score", float("nan")) or float("nan"))
+            snapshot_age = float(row.get("snapshot_age_sec", float("nan")) or float("nan"))
+            score_text = f"{trust_score:.1f}" if np.isfinite(trust_score) else "n/a"
+            age_text = f"{snapshot_age:.0f}s" if np.isfinite(snapshot_age) else "n/a"
+            button.setText(
+                f"{focus_label}\n{row.get('expiration', 'n/a')}  trust={trust_status}\n"
+                f"score={score_text}  age={age_text}"
+            )
+            button.setStyleSheet(self._scanner_card_style(trust_status, is_selected))
+
+    def _scanner_card_style(self, trust_status: str, is_selected: bool) -> str:
+        palette = {
+            "trusted": ("#edf9ef", "#2e7d32"),
+            "review": ("#fff8e1", "#f9a825"),
+            "caution": ("#fdecea", "#c62828"),
+            "unavailable": ("#f4f5f7", "#78909c"),
+        }
+        background, accent = palette.get(trust_status, palette["review"])
+        border_width = "2px" if is_selected else "1px"
+        return (
+            "QPushButton {"
+            f"background-color: {background};"
+            f"border: {border_width} solid {accent};"
+            "border-radius: 8px;"
+            "padding: 10px;"
+            "text-align: left;"
+            "font-weight: 600;"
+            "}"
+        )
+
+    def _apply_scanner_drilldown(self, expiration: str) -> None:
+        self._set_combo_text(self._overlay_expiry, expiration, fallback="all")
+        self._set_combo_text(self._price_error_expiry, expiration)
+        self._set_combo_text(self._validation_expiry, expiration, fallback="all")
+        self._set_combo_text(self._density_expiry, expiration)
+        self._set_combo_text(self._temporal_expiry, expiration)
+        self._request_overlay_refresh()
+        self._refresh_price_error_plot()
+        self._refresh_validation_view()
+        self._refresh_calendar_density_view()
+        self._refresh_temporal_plot()
+
+    def _set_combo_text(self, combo: QComboBox, target: str, *, fallback: str | None = None) -> None:
+        idx = combo.findText(target)
+        if idx < 0 and fallback is not None:
+            idx = combo.findText(fallback)
+        if idx < 0:
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
 
     def _selected_engine_mask(self) -> set[str]:
         mapping = {
@@ -753,6 +1659,88 @@ class MainWindow(QMainWindow):
                 selected.update(mapping.get(key, set()))
         return selected
 
+    def _refresh_live_runtime_status(self) -> None:
+        if self._live_runtime_status_callback is None:
+            return
+        payload = self._live_runtime_status_callback() or {}
+        state = str(payload.get("state", "idle"))
+        message = str(payload.get("message", "waiting for live status"))
+        expiration = str(payload.get("expiration", "auto") or "auto")
+        fetch_scope = str(payload.get("fetch_scope", "n/a") or "n/a")
+        cadence_mode = str(payload.get("cadence_mode", "n/a") or "n/a")
+        hot_seconds = int(payload.get("cadence_hot_seconds", 0) or 0)
+        full_seconds = int(payload.get("cadence_full_snapshot_seconds", 0) or 0)
+        cadence_suffix = f" scope={fetch_scope} cadence={cadence_mode} hot={hot_seconds}s full={full_seconds}s"
+        if state == "ok":
+            rows = int(payload.get("rows", 0) or 0)
+            latency_ms = float(payload.get("latency_ms", 0.0) or 0.0)
+            self._live_runtime_status.setText(
+                f"Live runtime: ok expiry={expiration} rows={rows} latency_ms={latency_ms:.2f}{cadence_suffix}"
+            )
+            return
+        if state == "empty":
+            self._live_runtime_status.setText(
+                f"Live runtime: no rows returned for expiry={expiration}. Try choosing an explicit expiry from the dropdown.{cadence_suffix}"
+            )
+            return
+        if state == "error":
+            error_type = str(payload.get("error_type", "error"))
+            self._live_runtime_status.setText(
+                f"Live runtime: {error_type} while polling expiry={expiration}: {message}{cadence_suffix}"
+            )
+            return
+        self._live_runtime_status.setText(f"Live runtime: {message}{cadence_suffix}")
+
+    def _configure_live_expiration_controls(self, symbol: str, selected: str | None) -> None:
+        if self._expiration_lookup_callback is None:
+            configure_expiration_combo(
+                self._live_expiration,
+                [],
+                auto_label="Auto (configured scope)",
+                disabled_label="Live expiry lookup unavailable",
+            )
+            self._live_expiration_status.setText("Live expiry: lookup is unavailable in this runtime.")
+            return
+        if not self._live_expiration_enabled:
+            configure_expiration_combo(
+                self._live_expiration,
+                [],
+                auto_label="Auto (configured scope)",
+                disabled_label="Live expiry available in ui_live during market hours",
+            )
+            self._live_expiration_status.setText(
+                "Live expiry: start ui_live during market hours to switch the live chain interactively."
+            )
+            return
+        expirations = [str(exp).strip() for exp in self._expiration_lookup_callback(symbol) if str(exp).strip()]
+        configure_expiration_combo(
+            self._live_expiration,
+            expirations,
+            selected=selected,
+            auto_label="Auto (configured scope)",
+            enabled=True,
+        )
+        if expirations:
+            choice = selected or "auto"
+            self._live_expiration_status.setText(
+                f"Live expiry: current selection={choice}. Changes apply on the next live poll."
+            )
+        else:
+            self._live_expiration_status.setText(
+                "Live expiry: yfinance did not return explicit expiries yet, so Auto will keep using the configured scope."
+            )
+
+    def _on_live_expiration_changed(self) -> None:
+        if self._live_expiration_setter is None:
+            return
+        expiration = self._live_expiration.currentData()
+        selected = str(expiration).strip() if expiration else None
+        self._live_expiration_setter(selected)
+        label = selected or "auto"
+        self._live_expiration_status.setText(
+            f"Live expiry: current selection={label}. Changes apply on the next live poll."
+        )
+
     def _refresh_latest_snapshot(self) -> None:
         if self._refresh_callback is None:
             self._snapshot_status.setText("Snapshot status: no refresh callback configured")
@@ -763,6 +1751,70 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover
             logger.exception("snapshot_refresh_failed err=%s", exc)
             self._snapshot_status.setText(f"Snapshot status: refresh failed: {exc}")
+
+    def _runtime_summary_text(self) -> str:
+        if not self._runtime_summary:
+            return "Runtime summary: unavailable"
+        ordered = [
+            "app_mode",
+            "ticker",
+            "expiration",
+            "refresh_ms",
+            "runtime_mode",
+            "ssvi_backend",
+            "fdm_backend",
+            "live_poll_seconds",
+            "live_focus_labels",
+            "live_hot_poll_seconds",
+            "live_full_snapshot_poll_seconds",
+            "stream_lock_enforced",
+            "provider_config",
+            "pipeline_config",
+            "session_state_path",
+        ]
+        lines = []
+        for key in ordered:
+            if key in self._runtime_summary:
+                lines.append(f"{key}={self._runtime_summary[key]}")
+        for key, value in self._runtime_summary.items():
+            if key not in ordered:
+                lines.append(f"{key}={value}")
+        return "Runtime summary:\n" + "\n".join(lines)
+
+    def _collect_session_config(self) -> dict[str, Any]:
+        return {
+            "mode": self._run_mode.currentText(),
+            "ticker": self._run_symbol_controls.ticker(),
+            "expiration": self._run_symbol_controls.expiration() or "",
+            "refresh_ms": int(self._run_refresh_ms.value()),
+            "allow_shared": self._run_allow_shared.isChecked(),
+            "provider_config": self._run_provider_config.text().strip(),
+            "pipeline_config": self._run_pipeline_config.text().strip(),
+        }
+
+    def _apply_display_settings(self) -> None:
+        refresh_ms = max(int(self._run_refresh_ms.value()), 10)
+        self._timer.setInterval(refresh_ms)
+        self._session_config.update(self._collect_session_config())
+        self._runtime_summary["refresh_ms"] = refresh_ms
+        self._run_runtime_summary.setText(self._runtime_summary_text())
+        self._run_config_status.setText(
+            f"Run Config: applied UI refresh interval={refresh_ms}ms now. Other changes will take effect next launch."
+        )
+
+    def _save_session_settings(self) -> None:
+        payload = self._collect_session_config()
+        self._session_config.update(payload)
+        if self._session_save_callback is None:
+            self._run_config_status.setText("Run Config: no session-save callback is configured.")
+            return
+        try:
+            message = self._session_save_callback(payload)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("session_save_failed err=%s", exc)
+            self._run_config_status.setText(f"Run Config: failed to save session settings: {exc}")
+            return
+        self._run_config_status.setText(f"Run Config: {message}")
 
     def _schedule_notice(self, snapshot: SymbolSnapshot) -> str:
         now_et = datetime.now(ZoneInfo(self._snapshot_timezone))
@@ -889,8 +1941,19 @@ def run_ui(
     market_close_freeze_time: str = "17:00",
     final_prices_refresh_time: str = "17:30",
     oi_refresh_time: str = "20:30",
+    session_config: dict[str, Any] | None = None,
+    runtime_summary: dict[str, Any] | None = None,
+    session_save_callback: Callable[[dict[str, Any]], str] | None = None,
+    bootstrap_message: str | None = None,
+    symbol_search_callback: Callable[[str], list[dict[str, str]]] | None = None,
+    expiration_lookup_callback: Callable[[str], list[str]] | None = None,
+    live_expiration: str | None = None,
+    live_expiration_setter: Callable[[str | None], None] | None = None,
+    live_expiration_enabled: bool = False,
+    live_runtime_status_callback: Callable[[], dict[str, object]] | None = None,
+    app: QApplication | None = None,
 ) -> int:
-    app = QApplication(sys.argv)
+    qt_app = app or QApplication.instance() or QApplication(sys.argv)
     window = MainWindow(
         cache=cache,
         refresh_ms=refresh_ms,
@@ -906,7 +1969,17 @@ def run_ui(
         market_close_freeze_time=market_close_freeze_time,
         final_prices_refresh_time=final_prices_refresh_time,
         oi_refresh_time=oi_refresh_time,
+        session_config=session_config,
+        runtime_summary=runtime_summary,
+        session_save_callback=session_save_callback,
+        bootstrap_message=bootstrap_message,
+        symbol_search_callback=symbol_search_callback,
+        expiration_lookup_callback=expiration_lookup_callback,
+        live_expiration=live_expiration,
+        live_expiration_setter=live_expiration_setter,
+        live_expiration_enabled=live_expiration_enabled,
+        live_runtime_status_callback=live_runtime_status_callback,
     )
     window.resize(1280, 860)
     window.show()
-    return app.exec()
+    return qt_app.exec()

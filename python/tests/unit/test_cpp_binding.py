@@ -28,6 +28,7 @@ def test_cpp_calibrate_ssvi_returns_metadata_dict() -> None:
     out = quantcore.calibrate_ssvi(
         [90.0, 95.0, 100.0, 105.0, 110.0],
         [0.25, 0.22, 0.20, 0.21, 0.24],
+        [1.0, 1.0, 1.0, 1.0, 1.0],
         {"a": 0.01, "b": 0.1, "rho": -0.2, "m": 0.0, "sigma": 0.25},
     )
 

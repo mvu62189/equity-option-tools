@@ -21,10 +21,7 @@ def map_provider_records(
     snapshot_id: str | None = None,
     underlying_symbol: str | None = None,
 ) -> pl.DataFrame:
-    """Map provider-native frame into canonical schema.
-
-    Drops rows only where bid == 0 and ask == 0.
-    """
+    """Map provider-native frame into canonical schema."""
     if records.is_empty():
         return pl.DataFrame({col: [] for col in CANONICAL_COLUMNS})
 
@@ -33,8 +30,13 @@ def map_provider_records(
         raise MappingError(f"Missing provider fields: {missing}")
 
     selected = records.select([pl.col(src).alias(dst) for src, dst in mapping.field_map.items()])
+    if "contract_symbol" not in selected.columns and "symbol" in selected.columns:
+        selected = selected.with_columns(pl.col("symbol").alias("contract_symbol"))
     if underlying_symbol:
         selected = selected.with_columns(pl.lit(underlying_symbol).alias("symbol"))
+    elif "symbol" not in selected.columns and "contract_symbol" in selected.columns:
+        # Direct mapper unit tests and ad hoc mapping calls may not know the underlying yet.
+        selected = selected.with_columns(pl.col("contract_symbol").alias("symbol"))
 
     sid = snapshot_id or str(uuid4())
     if "provider" not in selected.columns:

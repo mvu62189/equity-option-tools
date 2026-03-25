@@ -1,0 +1,106 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint_typecheck:
+    name: lint and typecheck
+    runs-on: windows-latest
+    env:
+      TMP: ${{ runner.temp }}\pytest
+      TEMP: ${{ runner.temp }}\pytest
+      TMPDIR: ${{ runner.temp }}\pytest
+      PYTHONPATH: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dev dependencies
+        shell: pwsh
+        run: python -m pip install -e '.[dev]'
+      - name: Ruff check
+        shell: pwsh
+        run: python -m ruff check python scripts
+      - name: Ruff format check
+        shell: pwsh
+        run: python -m ruff format --check python scripts
+      - name: Mypy
+        shell: pwsh
+        run: python -m mypy python
+
+  tests:
+    name: unit and integration tests
+    runs-on: windows-latest
+    env:
+      TMP: ${{ runner.temp }}\pytest
+      TEMP: ${{ runner.temp }}\pytest
+      TMPDIR: ${{ runner.temp }}\pytest
+      PYTHONPATH: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dev dependencies
+        shell: pwsh
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        shell: pwsh
+        run: python -m pytest -q -p no:cacheprovider --basetemp "$env:RUNNER_TEMP\pytest-base" python/tests/unit python/tests/integration
+
+  quantcore_smoke:
+    name: quantcore build and import smoke
+    runs-on: windows-latest
+    env:
+      TMP: ${{ runner.temp }}\pytest
+      TEMP: ${{ runner.temp }}\pytest
+      TMPDIR: ${{ runner.temp }}\pytest
+      PYTHONPATH: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Build editable package
+        shell: pwsh
+        run: python -m pip install -e .
+      - name: Import quantcore
+        shell: pwsh
+        run: python -c "import quantcore; print(quantcore.__file__)"
+
+  perf:
+    name: perf report
+    runs-on: windows-latest
+    continue-on-error: true
+    env:
+      TMP: ${{ runner.temp }}\pytest
+      TEMP: ${{ runner.temp }}\pytest
+      TMPDIR: ${{ runner.temp }}\pytest
+      PYTHONPATH: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dev dependencies
+        shell: pwsh
+        run: python -m pip install -e '.[dev]'
+      - name: Run perf benchmarks
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          python scripts\benchmark_calibration.py 50 | Tee-Object -FilePath artifacts\calibration.txt
+          python scripts\benchmark_laplace.py --runs 200 | Tee-Object -FilePath artifacts\laplace.txt
+      - name: Upload perf artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: artifacts

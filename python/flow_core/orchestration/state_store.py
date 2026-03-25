@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -17,6 +17,14 @@ DATASET_NAMES = [
     "parity",
     "parity_detail",
     "diagnostics",
+    "quote_quality_points",
+    "surface_points",
+    "surface_diagnostics",
+    "focus_expiry_summary",
+    "dealer_exposure_points",
+    "flow_proxy_points",
+    "scanner_levels",
+    "runtime_metrics",
     "overlay",
 ]
 
@@ -28,6 +36,14 @@ DEFAULT_BUDGET_MB = {
     "parity": 64,
     "parity_detail": 128,
     "diagnostics": 64,
+    "quote_quality_points": 128,
+    "surface_points": 256,
+    "surface_diagnostics": 64,
+    "focus_expiry_summary": 32,
+    "dealer_exposure_points": 96,
+    "flow_proxy_points": 96,
+    "scanner_levels": 96,
+    "runtime_metrics": 32,
     "overlay": 128,
 }
 
@@ -39,9 +55,17 @@ DEFAULT_ROW_CAPS = {
     "parity": 5_000,
     "parity_detail": 10_000,
     "diagnostics": 2_000,
+    "quote_quality_points": 10_000,
+    "surface_points": 10_000,
+    "surface_diagnostics": 2_000,
+    "focus_expiry_summary": 2_000,
+    "dealer_exposure_points": 10_000,
+    "flow_proxy_points": 10_000,
+    "scanner_levels": 10_000,
+    "runtime_metrics": 2_000,
 }
 
-TRIM_ORDER = ["parity_detail", "diagnostics", "ssvi", "greeks", "raw"]
+TRIM_ORDER = ["parity_detail", "diagnostics", "ssvi", "quote_quality_points", "greeks", "raw"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,3 +418,4 @@ class LiveStateStore:
         counters = dict(snapshot.drop_counters)
         counters[dataset] = counters.get(dataset, 0) + amount
         self._snapshots[symbol] = replace(snapshot, drop_counters=counters)
+

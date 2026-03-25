@@ -12,6 +12,7 @@ class OptionType(StrEnum):
 
 CANONICAL_COLUMNS = [
     "symbol",
+    "contract_symbol",
     "asof_ts",
     "expiration",
     "option_type",
@@ -29,6 +30,7 @@ CANONICAL_COLUMNS = [
 
 REQUIRED_CANONICAL_COLUMNS = [
     "symbol",
+    "contract_symbol",
     "asof_ts",
     "expiration",
     "option_type",
@@ -45,6 +47,7 @@ REQUIRED_CANONICAL_COLUMNS = [
 
 CANONICAL_DTYPES = {
     "symbol": pl.String,
+    "contract_symbol": pl.String,
     "asof_ts": pl.Datetime(time_unit="us", time_zone="UTC"),
     "expiration": pl.Date,
     "option_type": pl.String,

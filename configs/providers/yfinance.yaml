@@ -13,7 +13,7 @@ required_fields:
   - asofTs
   - underlyingPrice
 field_map:
-  contractSymbol: symbol
+  contractSymbol: contract_symbol
   strike: strike
   bid: bid
   ask: ask

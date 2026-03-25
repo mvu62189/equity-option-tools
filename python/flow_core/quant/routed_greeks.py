@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover
 
 ROUTED_GREEKS_COLUMNS = [
     "symbol",
+    "contract_symbol",
     "asof_ts",
     "batch_id",
     "input_snapshot_kind",
@@ -66,9 +67,51 @@ ROUTED_GREEKS_COLUMNS = [
     "error",
 ]
 
+ROUTED_GREEKS_DTYPES = {
+    "symbol": pl.String,
+    "contract_symbol": pl.String,
+    "asof_ts": pl.Datetime(time_zone="UTC"),
+    "batch_id": pl.String,
+    "input_snapshot_kind": pl.String,
+    "expiration": pl.Datetime(time_zone="UTC"),
+    "option_type": pl.String,
+    "strike": pl.Float64,
+    "underlying_price": pl.Float64,
+    "implied_vol": pl.Float64,
+    "days_to_expiry": pl.Int64,
+    "tau_years": pl.Float64,
+    "market_bid": pl.Float64,
+    "market_ask": pl.Float64,
+    "market_last": pl.Float64,
+    "market_mid": pl.Float64,
+    "greeks_engine": pl.String,
+    "engine_used": pl.String,
+    "backend_used": pl.String,
+    "fallback_reason": pl.String,
+    "runtime_mode": pl.String,
+    "jump_interp_mode": pl.String,
+    "space_mode": pl.String,
+    "rate_used": pl.Float64,
+    "dividend_used": pl.Float64,
+    "theta_convention": pl.String,
+    "vega_method": pl.String,
+    "rho_method": pl.String,
+    "price": pl.Float64,
+    "model_price": pl.Float64,
+    "display_price": pl.Float64,
+    "display_price_source": pl.String,
+    "delta": pl.Float64,
+    "gamma": pl.Float64,
+    "theta": pl.Float64,
+    "vega": pl.Float64,
+    "rho": pl.Float64,
+    "success": pl.Boolean,
+    "error": pl.String,
+}
+
 
 def _empty_greeks() -> pl.DataFrame:
-    return pl.DataFrame({c: [] for c in ROUTED_GREEKS_COLUMNS})
+    return pl.DataFrame(schema=ROUTED_GREEKS_DTYPES)
 
 
 def _to_utc_datetime(value: datetime | date | None) -> datetime:
@@ -171,6 +214,7 @@ def _row_base(row: dict) -> dict:
     tau = float(row.get("tau_years", float("nan"))) if row.get("tau_years") is not None else float("nan")
     return {
         "symbol": str(row.get("symbol", "")),
+        "contract_symbol": str(row.get("contract_symbol", "")),
         "asof_ts": row.get("asof_ts"),
         "batch_id": str(row.get("batch_id", "")),
         "input_snapshot_kind": str(row.get("snapshot_kind", "")),
@@ -178,7 +222,7 @@ def _row_base(row: dict) -> dict:
         "option_type": str(row.get("option_type", "")).lower(),
         "strike": float(row.get("strike", float("nan"))),
         "underlying_price": float(row.get("underlying_price", float("nan"))),
-        "implied_vol": float(row.get("implied_vol_vendor", float("nan"))),
+        "implied_vol": float(row.get("implied_vol_input", row.get("iv_ref", row.get("implied_vol_vendor", float("nan"))))),
         "days_to_expiry": int(row.get("days_to_expiry", 0)),
         "tau_years": tau,
         "market_bid": float(row.get("bid", float("nan"))),
@@ -665,7 +709,6 @@ def compute_routed_greeks(
         "option_type",
         "strike",
         "underlying_price",
-        "implied_vol_vendor",
         "greeks_engine",
     }
     if frame.is_empty() or not needed.issubset(frame.columns):
@@ -678,10 +721,10 @@ def compute_routed_greeks(
         row["fallback_reason"] = ""
         row["jump_interp_mode"] = ""
         row["space_mode"] = "strike"
-        vol = float(row.get("implied_vol_vendor") or float("nan"))
+        vol = float(row.get("implied_vol_input", row.get("iv_ref", row.get("implied_vol_vendor", float("nan")))) or float("nan"))
         spot = float(row.get("underlying_price") or float("nan"))
         strike = float(row.get("strike") or float("nan"))
-        if not (math.isfinite(vol) and 0.0 < vol < 5.0 and math.isfinite(spot) and spot > 0.0 and math.isfinite(strike)):
+        if not (math.isfinite(vol) and vol > 0.0 and math.isfinite(spot) and spot > 0.0 and math.isfinite(strike)):
             out_rows.append(_nan_result(row, str(row.get("greeks_engine", "")), "invalid_input"))
             continue
 

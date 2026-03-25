@@ -4,7 +4,8 @@ import polars as pl
 
 
 def build_dispatch_summary(frame: pl.DataFrame) -> pl.DataFrame:
-    needed = {"expiration", "iv_engine", "greeks_engine", "implied_vol_vendor"}
+    vol_col = "implied_vol_input" if "implied_vol_input" in frame.columns else ("iv_ref" if "iv_ref" in frame.columns else "implied_vol_vendor")
+    needed = {"expiration", "iv_engine", "greeks_engine", vol_col}
     if frame.is_empty() or not needed.issubset(frame.columns):
         return pl.DataFrame(
             {
@@ -19,9 +20,9 @@ def build_dispatch_summary(frame: pl.DataFrame) -> pl.DataFrame:
         )
 
     filtered = frame.filter(
-        pl.col("implied_vol_vendor").is_not_null()
-        & (pl.col("implied_vol_vendor") > 0.0)
-        & (pl.col("implied_vol_vendor") < 5.0)
+        pl.col(vol_col).is_not_null()
+        & (pl.col(vol_col) > 0.0)
+        & pl.col(vol_col).is_finite()
     )
     if filtered.is_empty():
         return pl.DataFrame(
@@ -40,9 +41,9 @@ def build_dispatch_summary(frame: pl.DataFrame) -> pl.DataFrame:
         filtered.group_by(["expiration", "iv_engine", "greeks_engine"])
         .agg(
             pl.len().alias("contracts"),
-            pl.mean("implied_vol_vendor").alias("avg_iv"),
-            pl.min("implied_vol_vendor").alias("min_iv"),
-            pl.max("implied_vol_vendor").alias("max_iv"),
+            pl.mean(vol_col).alias("avg_iv"),
+            pl.min(vol_col).alias("min_iv"),
+            pl.max(vol_col).alias("max_iv"),
         )
         .sort(["expiration", "iv_engine", "greeks_engine"])
     )

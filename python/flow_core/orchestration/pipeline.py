@@ -5,6 +5,7 @@ import gc
 import importlib.util
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -19,7 +20,11 @@ from flow_core.ingestion.providers.base import ProviderAdapter
 from flow_core.ingestion.snapshot import SnapshotIngestor
 from flow_core.orchestration.calibration_diagnostics import make_calibration_diagnostic_row, make_ssvi_diagnostic_row
 from flow_core.orchestration.cache import InMemoryQuoteCache
+from flow_core.orchestration.quote_quality import build_quote_quality
+from flow_core.orchestration.runtime_metrics import make_runtime_metrics_row
+from flow_core.orchestration.short_expiry_scanner import build_short_expiry_scanner_bundle
 from flow_core.orchestration.scheduler import run_eod_scheduler
+from flow_core.orchestration.surface_diagnostics import build_surface_diagnostics
 from flow_core.orchestration.state_store import BatchPayload
 from flow_core.quant.deamericanization import evaluate_parity_diagnostics
 from flow_core.quant.dispatch import build_dispatch_summary
@@ -70,6 +75,268 @@ def _tag_frame(
     out = _ensure_col(out, "snapshot_kind", snapshot_kind)
     out = _ensure_col(out, "source_mode", source_mode)
     return out
+
+
+def _run_ssvi_fit(
+    slice_frame: pl.DataFrame,
+    *,
+    config: PipelineConfig,
+    init_guess: dict[str, float] | None,
+    fit_space: str,
+    weight_col: str,
+) -> tuple[SSVIResult, str, str]:
+    backend_used = "python"
+    failure_reason = ""
+    primary: SSVIResult | None = None
+    if fit_space == "log" and config.ssvi_backend in {"cpp", "auto"}:
+        try:
+            primary_cpp, meta_cpp = calibrate_ssvi_cpp(
+                slice_frame,
+                init_guess=init_guess,
+                rate=config.parity_rate,
+                dividend=config.parity_dividend,
+                vol_col="implied_vol_input",
+                weight_col=weight_col,
+            )
+            primary = primary_cpp
+            backend_used = "cpp"
+            failure_reason = str(meta_cpp.get("reason", ""))
+            if not primary.success and config.runtime_mode != "live_strict" and config.ssvi_backend == "auto":
+                fallback_reason = failure_reason or "cpp_nonconverged"
+                primary = calibrate_ssvi(
+                    slice_frame,
+                    init_guess=init_guess,
+                    fit_space=fit_space,
+                    rate=config.parity_rate,
+                    dividend=config.parity_dividend,
+                    vol_col="implied_vol_input",
+                    weight_col=weight_col,
+                )
+                backend_used = "python"
+                failure_reason = f"fallback:{fallback_reason}"
+        except Exception as exc:
+            if config.runtime_mode == "live_strict":
+                primary = SSVIResult(
+                    a=0.0,
+                    b=0.0,
+                    rho=0.0,
+                    m=0.0,
+                    sigma=0.0,
+                    objective=float("inf"),
+                    success=False,
+                    iterations=0,
+                    durrleman_pass=False,
+                )
+                backend_used = "cpp"
+                failure_reason = f"cpp_error:{exc}"
+            else:
+                primary = calibrate_ssvi(
+                    slice_frame,
+                    init_guess=init_guess,
+                    fit_space=fit_space,
+                    rate=config.parity_rate,
+                    dividend=config.parity_dividend,
+                    vol_col="implied_vol_input",
+                    weight_col=weight_col,
+                )
+                backend_used = "python"
+                failure_reason = f"fallback:cpp_error:{exc}"
+    elif config.ssvi_backend == "cpp" and fit_space != "log":
+        primary = SSVIResult(
+            a=0.0,
+            b=0.0,
+            rho=0.0,
+            m=0.0,
+            sigma=0.0,
+            objective=float("inf"),
+            success=False,
+            iterations=0,
+            durrleman_pass=False,
+        )
+        backend_used = "cpp"
+        failure_reason = "cpp_ssvi_supports_log_only"
+    if primary is None:
+        primary = calibrate_ssvi(
+            slice_frame,
+            init_guess=init_guess,
+            fit_space=fit_space,
+            rate=config.parity_rate,
+            dividend=config.parity_dividend,
+            vol_col="implied_vol_input",
+            weight_col=weight_col,
+        )
+        backend_used = "python"
+    return primary, backend_used, failure_reason
+
+
+def _build_ssvi_outputs(
+    calibration_input: pl.DataFrame,
+    *,
+    symbol: str,
+    asof_ts: datetime,
+    batch_id: str,
+    trading_date: str,
+    snapshot_kind: str,
+    source_mode: str,
+    config: PipelineConfig,
+) -> tuple[pl.DataFrame, list[pl.DataFrame], str | None]:
+    required = {"expiration", "option_type", "implied_vol_input", "weight_uniform", "weight_atm", "weight_atm_corridor_tightness"}
+    if calibration_input.is_empty() or not required.issubset(calibration_input.columns):
+        return pl.DataFrame(), [], None
+
+    init_guess = {"a": 0.01, "b": 0.1, "rho": -0.2, "m": 0.0, "sigma": 0.25} if config.ssvi_warm_start else None
+    summary_rows: list[dict[str, object]] = []
+    calibration_frames: list[pl.DataFrame] = []
+    ssvi_error: str | None = None
+    weight_modes = [
+        ("uniform", "weight_uniform"),
+        ("atm_only", "weight_atm"),
+        ("atm_x_corridor_tightness", "weight_atm_corridor_tightness"),
+    ]
+
+    for group_key, slice_frame in calibration_input.partition_by(["expiration", "option_type"], as_dict=True).items():
+        if isinstance(group_key, tuple):
+            expiration, option_type = group_key
+        else:
+            expiration = group_key
+            option_type = "all"
+        if slice_frame.height < 3:
+            failure = "insufficient_clean_core"
+            if ssvi_error is None and config.runtime_mode == "live_strict":
+                ssvi_error = f"{failure} symbol={symbol} expiration={expiration} option_type={option_type}"
+            summary_rows.append(
+                {
+                    "expiration": expiration,
+                    "option_type": option_type,
+                    "weight_mode": "atm_only",
+                    "fit_space": config.ssvi_fit_space,
+                    "objective": float("inf"),
+                    "iterations": 0,
+                    "success": False,
+                    "a": 0.0,
+                    "b": 0.0,
+                    "rho": 0.0,
+                    "m": 0.0,
+                    "sigma": 0.0,
+                    "compare_fit_space": "",
+                    "compare_objective": float("nan"),
+                    "compare_iterations": 0,
+                    "compare_success": False,
+                    "backend_used": "",
+                    "runtime_mode": config.runtime_mode,
+                    "failure_reason": failure,
+                }
+            )
+            calibration_frames.append(
+                make_calibration_diagnostic_row(
+                    symbol=symbol,
+                    asof_ts=asof_ts,
+                    expiration=expiration,
+                    batch_id=batch_id,
+                    snapshot_kind=snapshot_kind,
+                    source_mode=source_mode,
+                    trading_date=trading_date,
+                    model_id=f"ssvi_{option_type}_atm_only_{config.ssvi_fit_space}",
+                    backend_used="",
+                    runtime_mode=config.runtime_mode,
+                    converged=False,
+                    iterations=0,
+                    sse_final=float("inf"),
+                    durrleman_pass=False,
+                    failure_reason=failure,
+                )
+            )
+            continue
+
+        for weight_mode, weight_col in weight_modes:
+            result, backend_used, failure_reason = _run_ssvi_fit(
+                slice_frame,
+                config=config,
+                init_guess=init_guess,
+                fit_space=config.ssvi_fit_space,
+                weight_col=weight_col,
+            )
+            compare: SSVIResult | None = None
+            compare_space = ""
+            if (
+                weight_mode == "atm_only"
+                and config.ssvi_enable_space_compare
+                and config.ssvi_compare_fit_space != config.ssvi_fit_space
+            ):
+                compare_space = config.ssvi_compare_fit_space
+                compare = calibrate_ssvi(
+                    slice_frame,
+                    init_guess=init_guess,
+                    fit_space=compare_space,
+                    rate=config.parity_rate,
+                    dividend=config.parity_dividend,
+                    vol_col="implied_vol_input",
+                    weight_col=weight_col,
+                )
+                calibration_frames.append(
+                    make_ssvi_diagnostic_row(
+                        symbol=symbol,
+                        asof_ts=asof_ts,
+                        expiration=expiration,
+                        batch_id=batch_id,
+                        snapshot_kind=snapshot_kind,
+                        source_mode=source_mode,
+                        trading_date=trading_date,
+                        model_id=f"ssvi_{option_type}_{weight_mode}_{compare_space}",
+                        result=compare,
+                        backend_used="python",
+                        runtime_mode=config.runtime_mode,
+                        failure_reason="",
+                    )
+                )
+
+            summary_rows.append(
+                {
+                    "expiration": expiration,
+                    "option_type": option_type,
+                    "weight_mode": weight_mode,
+                    "fit_space": config.ssvi_fit_space,
+                    "objective": result.objective,
+                    "iterations": result.iterations,
+                    "success": result.success,
+                    "a": result.a,
+                    "b": result.b,
+                    "rho": result.rho,
+                    "m": result.m,
+                    "sigma": result.sigma,
+                    "compare_fit_space": compare_space,
+                    "compare_objective": compare.objective if compare is not None else float("nan"),
+                    "compare_iterations": compare.iterations if compare is not None else 0,
+                    "compare_success": compare.success if compare is not None else False,
+                    "backend_used": backend_used,
+                    "runtime_mode": config.runtime_mode,
+                    "failure_reason": failure_reason,
+                }
+            )
+            calibration_frames.append(
+                make_ssvi_diagnostic_row(
+                    symbol=symbol,
+                    asof_ts=asof_ts,
+                    expiration=expiration,
+                    batch_id=batch_id,
+                    snapshot_kind=snapshot_kind,
+                    source_mode=source_mode,
+                    trading_date=trading_date,
+                    model_id=f"ssvi_{option_type}_{weight_mode}_{config.ssvi_fit_space}",
+                    result=result,
+                    backend_used=backend_used,
+                    runtime_mode=config.runtime_mode,
+                    failure_reason=failure_reason,
+                )
+            )
+            if weight_mode == "atm_only" and config.ssvi_fit_space == "log" and not result.success and ssvi_error is None:
+                ssvi_error = (
+                    f"primary_ssvi_log_fit_failed symbol={symbol} expiration={expiration} option_type={option_type} "
+                    f"objective={result.objective:.6e} iterations={result.iterations}"
+                )
+
+    ssvi_summary = pl.DataFrame(summary_rows) if summary_rows else pl.DataFrame()
+    return ssvi_summary, calibration_frames, ssvi_error
 
 
 def _snapshot_catalog_row(
@@ -197,19 +464,31 @@ class QuantPipelineService:
         self,
         symbol: str,
         expiration: str | None = None,
+        expiration_resolver: Callable[[], str | None] | None = None,
+        status_callback: Callable[[dict[str, object]], None] | None = None,
         stop_event: asyncio.Event | None = None,
     ) -> None:
         event = stop_event or asyncio.Event()
-        if expiration is None:
+        configured_expiration = expiration
+        if configured_expiration is None:
             if self.config.live_expiry_scope == "selected" and self.config.live_selected_expiries:
-                expiration = ",".join(self.config.live_selected_expiries)
+                configured_expiration = ",".join(self.config.live_selected_expiries)
             else:
-                expiration = self.config.live_expiry_scope
+                configured_expiration = self.config.live_expiry_scope
+
+        def _resolve_expiration() -> str | None:
+            if expiration_resolver is not None:
+                requested = expiration_resolver()
+                if requested:
+                    return requested
+            return configured_expiration
+
         worker = LiveIngestionWorker(
             adapter=self.adapter,
             provider_map=self.provider_map,
             config=self.config,
             on_batch=self._on_live_batch,
+            status_callback=status_callback,
         )
         flush_task = asyncio.create_task(self.buffered_writer.run_periodic_flush(event))
         mem_task = asyncio.create_task(self._run_memory_monitor(event))
@@ -221,7 +500,12 @@ class QuantPipelineService:
             )
         )
         try:
-            await worker.run(symbol=symbol, expiration=expiration, stop_event=event)
+            await worker.run(
+                symbol=symbol,
+                expiration=configured_expiration,
+                expiration_resolver=_resolve_expiration,
+                stop_event=event,
+            )
         finally:
             worker.stop()
             event.set()
@@ -422,8 +706,58 @@ class QuantPipelineService:
             return
 
         t0 = time.perf_counter()
-        greeks = compute_routed_greeks(
+        quote_quality = build_quote_quality(
             routed,
+            rate=self.config.parity_rate,
+            rate_curve=self.rate_curve,
+            dividend_source=self.dividend_source,
+        )
+        quote_quality_points = _tag_frame(
+            quote_quality.points,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        join_keys = [c for c in ("symbol", "contract_symbol", "expiration", "option_type", "strike") if c in routed.columns and c in quote_quality_points.columns]
+        routed_pricing = routed.join(
+            quote_quality_points.select(
+                [
+                    c
+                    for c in (
+                        *join_keys,
+                        "iv_ref",
+                        "weight_uniform",
+                        "weight_atm",
+                        "weight_corridor_tightness",
+                        "weight_atm_corridor_tightness",
+                        "market_mid",
+                        "eligible",
+                        "drop_reason",
+                        "strip_shape_fail",
+                        "euro_price_bid",
+                        "euro_price_ask",
+                        "euro_price_ref",
+                        "dual_delta_bid",
+                        "dual_delta_ask",
+                        "dual_delta_ref",
+                        "price_second_derivative_ref",
+                        "corridor_tightness",
+                        "vendor_iv_ref",
+                    )
+                    if c in quote_quality_points.columns
+                ]
+            ),
+            on=join_keys,
+            how="left",
+        )
+        latency["quote_quality_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
+        greeks = compute_routed_greeks(
+            routed_pricing,
             rate=self.config.parity_rate,
             dividend=self.config.parity_dividend,
             rate_curve=self.rate_curve,
@@ -445,129 +779,103 @@ class QuantPipelineService:
         )
         latency["pricing_ms"] = (time.perf_counter() - t0) * 1000.0
         latency["greeks_ms"] = latency["pricing_ms"]
+        quality_join_keys = [c for c in ("symbol", "contract_symbol", "expiration", "option_type", "strike") if c in greeks.columns and c in quote_quality_points.columns]
+        surface_input = greeks.join(
+            quote_quality_points,
+            on=quality_join_keys,
+            how="left",
+            suffix="_quality",
+        )
+        surface_bundle = build_surface_diagnostics(surface_input)
+        surface_points = _tag_frame(
+            surface_bundle.points,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        surface_diagnostics = _tag_frame(
+            surface_bundle.summary.with_columns(
+                pl.lit(self.config.runtime_mode).alias("runtime_mode"),
+                pl.lit(self.config.ssvi_backend).alias("ssvi_backend"),
+                pl.lit(self.config.fdm_backend).alias("fdm_backend"),
+            ),
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        previous_dealer_points = self.cache.get_history_nowait(symbol, "dealer_exposure_points")
+        scanner_bundle = build_short_expiry_scanner_bundle(
+            raw=routed,
+            greeks=greeks,
+            surface_points=surface_points,
+            previous_dealer_exposure_points=previous_dealer_points,
+            focus_labels=list(self.config.live_focus_labels),
+            symbol=symbol,
+            asof_ts=asof_ts,
+            batch_id=batch_id,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        focus_expiry_summary = _tag_frame(
+            scanner_bundle.focus_expiry_summary,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        dealer_exposure_points = _tag_frame(
+            scanner_bundle.dealer_exposure_points,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        flow_proxy_points = _tag_frame(
+            scanner_bundle.flow_proxy_points,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
+        scanner_levels = _tag_frame(
+            scanner_bundle.scanner_levels,
+            batch_id=batch_id,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+        )
 
         ssvi_summary = pl.DataFrame()
         calibration_frames: list[pl.DataFrame] = []
         ssvi_error: str | None = None
 
         t0 = time.perf_counter()
-        if "implied_vol_vendor" in routed.columns and routed["implied_vol_vendor"].null_count() < routed.height:
-            init_guess = {"a": 0.01, "b": 0.1, "rho": -0.2, "m": 0.0, "sigma": 0.25} if self.config.ssvi_warm_start else None
-            backend_used = "python"
-            failure_reason = ""
-            primary: SSVIResult | None = None
-            if self.config.ssvi_fit_space == "log" and self.config.ssvi_backend in {"cpp", "auto"}:
-                try:
-                    primary_cpp, meta_cpp = calibrate_ssvi_cpp(
-                        routed,
-                        init_guess=init_guess,
-                        rate=self.config.parity_rate,
-                        dividend=self.config.parity_dividend,
-                    )
-                    primary = primary_cpp
-                    backend_used = "cpp"
-                    failure_reason = str(meta_cpp.get("reason", ""))
-                    if not primary.success and self.config.runtime_mode != "live_strict" and self.config.ssvi_backend == "auto":
-                        fallback_reason = failure_reason or "cpp_nonconverged"
-                        primary = calibrate_ssvi(routed, init_guess=init_guess, fit_space=self.config.ssvi_fit_space)
-                        backend_used = "python"
-                        failure_reason = f"fallback:{fallback_reason}"
-                except Exception as exc:
-                    if self.config.runtime_mode == "live_strict":
-                        primary = SSVIResult(
-                            a=0.0,
-                            b=0.0,
-                            rho=0.0,
-                            m=0.0,
-                            sigma=0.0,
-                            objective=float("inf"),
-                            success=False,
-                            iterations=0,
-                            durrleman_pass=False,
-                        )
-                        backend_used = "cpp"
-                        failure_reason = f"cpp_error:{exc}"
-                    else:
-                        primary = calibrate_ssvi(routed, init_guess=init_guess, fit_space=self.config.ssvi_fit_space)
-                        backend_used = "python"
-                        failure_reason = f"fallback:cpp_error:{exc}"
-            elif self.config.ssvi_backend == "cpp" and self.config.ssvi_fit_space != "log":
-                primary = SSVIResult(
-                    a=0.0,
-                    b=0.0,
-                    rho=0.0,
-                    m=0.0,
-                    sigma=0.0,
-                    objective=float("inf"),
-                    success=False,
-                    iterations=0,
-                    durrleman_pass=False,
-                )
-                backend_used = "cpp"
-                failure_reason = "cpp_ssvi_supports_log_only"
-            if primary is None:
-                primary = calibrate_ssvi(routed, init_guess=init_guess, fit_space=self.config.ssvi_fit_space)
-                backend_used = "python"
-            compare = None
-            compare_space = self.config.ssvi_compare_fit_space
-            if self.config.ssvi_enable_space_compare and compare_space != self.config.ssvi_fit_space:
-                compare = calibrate_ssvi(routed, init_guess=init_guess, fit_space=compare_space)
-
-            expiration = routed["expiration"][0] if "expiration" in routed.columns else asof_ts
-            calibration_frames.append(
-                make_ssvi_diagnostic_row(
-                    symbol=symbol,
-                    asof_ts=asof_ts,
-                    expiration=expiration,
-                    batch_id=batch_id,
-                    snapshot_kind=snapshot_kind,
-                    source_mode=source_mode,
-                    trading_date=trading_date,
-                    model_id=f"ssvi_primary_{self.config.ssvi_fit_space}",
-                    result=primary,
-                    backend_used=backend_used,
-                    runtime_mode=self.config.runtime_mode,
-                    failure_reason=failure_reason,
-                )
-            )
-            if compare is not None:
-                calibration_frames.append(
-                    make_ssvi_diagnostic_row(
-                        symbol=symbol,
-                        asof_ts=asof_ts,
-                        expiration=expiration,
-                        batch_id=batch_id,
-                        snapshot_kind=snapshot_kind,
-                        source_mode=source_mode,
-                        trading_date=trading_date,
-                        model_id=f"ssvi_compare_{compare_space}",
-                        result=compare,
-                        backend_used="python",
-                        runtime_mode=self.config.runtime_mode,
-                        failure_reason="",
-                    )
-                )
-
-            ssvi_summary = pl.DataFrame(
-                {
-                    "fit_space": [self.config.ssvi_fit_space],
-                    "objective": [primary.objective],
-                    "iterations": [primary.iterations],
-                    "success": [primary.success],
-                    "a": [primary.a],
-                    "b": [primary.b],
-                    "rho": [primary.rho],
-                    "m": [primary.m],
-                    "sigma": [primary.sigma],
-                    "compare_fit_space": [compare_space if compare is not None else ""],
-                    "compare_objective": [compare.objective if compare is not None else float("nan")],
-                    "compare_iterations": [compare.iterations if compare is not None else 0],
-                    "compare_success": [compare.success if compare is not None else False],
-                    "backend_used": [backend_used],
-                    "runtime_mode": [self.config.runtime_mode],
-                    "failure_reason": [failure_reason],
-                }
-            )
+        ssvi_summary, calibration_frames, ssvi_error = _build_ssvi_outputs(
+            quote_quality.calibration_input,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            batch_id=batch_id,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+            config=self.config,
+        )
+        if not ssvi_summary.is_empty():
             ssvi_summary = _tag_frame(
                 ssvi_summary,
                 batch_id=batch_id,
@@ -577,24 +885,20 @@ class QuantPipelineService:
                 snapshot_kind=snapshot_kind,
                 source_mode=source_mode,
             )
-            if self.config.ssvi_fit_space == "log" and not primary.success:
-                ssvi_error = (
-                    "primary_ssvi_log_fit_failed "
-                    f"symbol={symbol} objective={primary.objective:.6e} iterations={primary.iterations}"
-                )
-                status["ssvi_fail"] = True
-                status["ssvi_error"] = ssvi_error
-                streak = self._nonconv_count.get(symbol, 0) + 1
-                self._nonconv_count[symbol] = streak
-                if streak >= self.config.nonconvergence_alert_threshold:
-                    logger.warning("ssvi_nonconvergence_streak symbol=%s streak=%s err=%s", symbol, streak, ssvi_error)
-            else:
-                self._nonconv_count[symbol] = 0
+        if ssvi_error is not None:
+            status["ssvi_fail"] = True
+            status["ssvi_error"] = ssvi_error
+            streak = self._nonconv_count.get(symbol, 0) + 1
+            self._nonconv_count[symbol] = streak
+            if streak >= self.config.nonconvergence_alert_threshold:
+                logger.warning("ssvi_nonconvergence_streak symbol=%s streak=%s err=%s", symbol, streak, ssvi_error)
+        else:
+            self._nonconv_count[symbol] = 0
         latency["calibration_ms"] = (time.perf_counter() - t0) * 1000.0
         latency["ssvi_ms"] = latency["calibration_ms"]
 
         t0 = time.perf_counter()
-        dispatch = build_dispatch_summary(routed)
+        dispatch = build_dispatch_summary(routed_pricing)
         dispatch = _tag_frame(
             dispatch,
             batch_id=batch_id,
@@ -609,7 +913,7 @@ class QuantPipelineService:
         parity_solver_diag = pl.DataFrame()
         if ssvi_error is None:
             parity_summary, parity_detail, parity_solver_diag = evaluate_parity_diagnostics(
-                routed,
+                routed_pricing,
                 rate=self.config.parity_rate,
                 dividend=self.config.parity_dividend,
                 eep_mode=self.config.parity_eep_mode,
@@ -716,6 +1020,13 @@ class QuantPipelineService:
         self.cache.append_history(symbol, "parity", parity_summary)
         self.cache.append_history(symbol, "parity_detail", parity_detail)
         self.cache.append_history(symbol, "diagnostics", calibration)
+        self.cache.append_history(symbol, "quote_quality_points", quote_quality_points)
+        self.cache.append_history(symbol, "surface_points", surface_points)
+        self.cache.append_history(symbol, "surface_diagnostics", surface_diagnostics)
+        self.cache.append_history(symbol, "focus_expiry_summary", focus_expiry_summary)
+        self.cache.append_history(symbol, "dealer_exposure_points", dealer_exposure_points)
+        self.cache.append_history(symbol, "flow_proxy_points", flow_proxy_points)
+        self.cache.append_history(symbol, "scanner_levels", scanner_levels)
 
         t0 = time.perf_counter()
         await self.buffered_writer.append_raw(routed)
@@ -733,6 +1044,44 @@ class QuantPipelineService:
             if not calibration.is_empty() and self._should_flush_diagnostics(symbol, flush_calibration_diagnostics):
                 await self.buffered_writer.append_derived(calibration, dataset="diagnostics", partition_col="symbol")
                 self._last_diag_flush_ts[symbol] = time.monotonic()
+            if not quote_quality_points.is_empty():
+                await self.buffered_writer.append_derived(
+                    quote_quality_points,
+                    dataset="quote_quality_points",
+                    partition_col="symbol",
+                )
+            if not surface_points.is_empty():
+                await self.buffered_writer.append_derived(surface_points, dataset="surface_points", partition_col="symbol")
+            if not surface_diagnostics.is_empty():
+                await self.buffered_writer.append_derived(
+                    surface_diagnostics,
+                    dataset="surface_diagnostics",
+                    partition_col="symbol",
+                )
+            if not focus_expiry_summary.is_empty():
+                await self.buffered_writer.append_derived(
+                    focus_expiry_summary,
+                    dataset="focus_expiry_summary",
+                    partition_col="symbol",
+                )
+            if not dealer_exposure_points.is_empty():
+                await self.buffered_writer.append_derived(
+                    dealer_exposure_points,
+                    dataset="dealer_exposure_points",
+                    partition_col="symbol",
+                )
+            if not flow_proxy_points.is_empty():
+                await self.buffered_writer.append_derived(
+                    flow_proxy_points,
+                    dataset="flow_proxy_points",
+                    partition_col="symbol",
+                )
+            if not scanner_levels.is_empty():
+                await self.buffered_writer.append_derived(
+                    scanner_levels,
+                    dataset="scanner_levels",
+                    partition_col="symbol",
+                )
             catalog = _snapshot_catalog_row(
                 batch_id=batch_id,
                 symbol=symbol,
@@ -750,6 +1099,28 @@ class QuantPipelineService:
             await self.buffered_writer.append_derived(catalog, dataset="snapshot_catalog", partition_col="symbol")
         latency["persist_ms"] = (time.perf_counter() - t0) * 1000.0
         latency["total_ms"] = (time.perf_counter() - batch_start) * 1000.0
+        current_snapshot = self.cache.get_snapshot_nowait(symbol)
+        runtime_metrics = make_runtime_metrics_row(
+            symbol=symbol,
+            asof_ts=asof_ts,
+            batch_id=batch_id,
+            version=version,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+            trading_date=trading_date,
+            runtime_mode=self.config.runtime_mode,
+            latency_ms=latency,
+            raw_rows=routed.height,
+            greeks_rows=greeks.height,
+            surface_rows=surface_points.height,
+            surface_summary_rows=surface_diagnostics.height,
+            diagnostics_rows=calibration.height,
+            memory_bytes=current_snapshot.memory_bytes if current_snapshot is not None else {},
+            drop_counters=current_snapshot.drop_counters if current_snapshot is not None else {},
+        )
+        self.cache.append_history(symbol, "runtime_metrics", runtime_metrics)
+        if self.derived_store is not None:
+            await self.buffered_writer.append_derived(runtime_metrics, dataset="runtime_metrics", partition_col="symbol")
 
         for row in parity_summary.to_dicts():
             logger.info(

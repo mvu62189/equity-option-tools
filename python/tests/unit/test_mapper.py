@@ -26,7 +26,7 @@ def provider_map() -> ProviderMap:
             "underlyingPrice",
         ],
         field_map={
-            "contractSymbol": "symbol",
+            "contractSymbol": "contract_symbol",
             "strike": "strike",
             "bid": "bid",
             "ask": "ask",
@@ -64,6 +64,7 @@ def test_mapper_applies_mapping_and_types() -> None:
     assert out.height == 1
     assert out["option_type"][0] == "call"
     assert out["provider"][0] == "yfinance"
+    assert out["contract_symbol"][0] == "SPY240621C00450000"
 
 
 def test_drop_rule_only_bid_ask_zero_rows_removed() -> None:
@@ -87,7 +88,7 @@ def test_drop_rule_only_bid_ask_zero_rows_removed() -> None:
 
     out = map_provider_records(records, provider_map())
     assert out.height == 2
-    assert set(out["symbol"].to_list()) == {"B", "C"}
+    assert set(out["contract_symbol"].to_list()) == {"B", "C"}
 
 
 def test_mapper_fills_nullable_market_fields() -> None:

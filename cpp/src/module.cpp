@@ -61,6 +61,7 @@ PYBIND11_MODULE(quantcore, m) {
       "calibrate_ssvi_log_slice",
       [](const std::vector<double>& strikes,
          const std::vector<double>& ivs,
+         const std::vector<double>& weights,
          double forward,
          double tau,
          const std::map<std::string, double>& init_guess,
@@ -68,7 +69,7 @@ PYBIND11_MODULE(quantcore, m) {
         quantcore::SsviCalibrationResult fit;
         {
           py::gil_scoped_release release;
-          fit = quantcore::calibrate_ssvi_log_slice(strikes, ivs, forward, tau, init_guess, constraints);
+          fit = quantcore::calibrate_ssvi_log_slice(strikes, ivs, weights, forward, tau, init_guess, constraints);
         }
         py::dict out;
         py::list p;
@@ -91,6 +92,7 @@ PYBIND11_MODULE(quantcore, m) {
       "calibrate_ssvi",
       [](const std::vector<double>& strikes,
          const std::vector<double>& ivs,
+         const std::vector<double>& weights,
          const std::map<std::string, double>& init_guess) {
         const double forward = quantcore::median_forward_guess(strikes);
         const std::map<std::string, double> constraints = {
@@ -100,7 +102,7 @@ PYBIND11_MODULE(quantcore, m) {
         quantcore::SsviCalibrationResult fit;
         {
           py::gil_scoped_release release;
-          fit = quantcore::calibrate_ssvi_log_slice(strikes, ivs, forward, 1.0, init_guess, constraints);
+          fit = quantcore::calibrate_ssvi_log_slice(strikes, ivs, weights, forward, 1.0, init_guess, constraints);
         }
         py::dict out;
         py::list p;

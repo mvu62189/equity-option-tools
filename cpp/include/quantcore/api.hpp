@@ -35,6 +35,7 @@ struct FdmCnLogResult {
 SsviCalibrationResult calibrate_ssvi_log_slice(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
+    const std::vector<double>& weights,
     double forward,
     double tau,
     const std::map<std::string, double>& init_guess,
@@ -43,6 +44,7 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
 std::map<std::string, double> calibrate_ssvi(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
+    const std::vector<double>& weights,
     const std::map<std::string, double>& init_guess);
 
 double price_bs(

@@ -156,8 +156,8 @@ def _mid_price(bid: float, ask: float, last: float | None) -> float:
 
 
 def _pair_sigma(call_row: dict, put_row: dict) -> float:
-    c_iv = float(call_row.get("implied_vol_vendor") or 0.0)
-    p_iv = float(put_row.get("implied_vol_vendor") or 0.0)
+    c_iv = float(call_row.get("implied_vol_input", call_row.get("iv_ref", call_row.get("implied_vol_vendor", 0.0))) or 0.0)
+    p_iv = float(put_row.get("implied_vol_input", put_row.get("iv_ref", put_row.get("implied_vol_vendor", 0.0))) or 0.0)
     vals = [v for v in (c_iv, p_iv) if v > 1e-6 and math.isfinite(v)]
     if not vals:
         return 0.2

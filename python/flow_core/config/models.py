@@ -16,6 +16,9 @@ class PipelineConfig(BaseModel):
     live_poll_seconds: int = Field(default=5, ge=1)
     live_expiry_scope: Literal["nearest", "0-7d", "0-30d", "selected", "all"] = "0-30d"
     live_selected_expiries: List[str] = Field(default_factory=list)
+    live_focus_labels: List[str] = Field(default_factory=lambda: ["0DTE", "1DTE", "EOW"])
+    live_hot_poll_seconds: int = Field(default=15, ge=1)
+    live_full_snapshot_poll_seconds: int = Field(default=300, ge=10)
     snapshot_eod_time: str = "20:00"
     snapshot_timezone: str = "America/New_York"
     market_close_freeze_time: str = "17:00"
