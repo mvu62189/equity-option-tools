@@ -7,54 +7,54 @@ Turn the app into a scanner-first SPY workstation without discarding the existin
 ## Shipped Shape
 
 - Landing page: `Short Expiry Scanner`
-- Drilldown: existing overlay, model-vs-market, validation, calendar/density, temporal, and routing tabs
-- Trust layer: quote quality, surface diagnostics, runtime metrics, and existing calibration validation
+- Detailed review: existing overlay, model-vs-market, validation, calendar/density, temporal, and routing tabs
+- Data-quality layer: quote cleaning, fitted-surface checks, and runtime metrics already used elsewhere in the app
 
 ## Runtime Model
 
-- `ui_live` now has two cadences:
-  - hot focused fetches for `0DTE`, `1DTE`, and `EOW`
-  - slower full-surface refreshes for validation context
-- The worker stays single-threaded on the async side. The change is in fetch scope and cadence, not in the concurrency topology.
+- `ui_live` now uses two refresh intervals:
+  - fast focused refreshes for `0DTE`, `1DTE`, and `EOW`
+  - slower full-surface refreshes so validation pages still have full-surface context
+- The async side still runs in one worker thread. The change is in what gets refreshed and how often, not in the overall concurrency design.
 
 ## Storage Model
 
-The feature adds four persisted derived datasets:
+The feature adds four saved derived datasets:
 
 - `focus_expiry_summary`
 - `dealer_exposure_points`
 - `flow_proxy_points`
 - `scanner_levels`
 
-These sit beside the existing validation datasets:
+These sit beside the existing saved validation datasets:
 
 - `quote_quality_points`
 - `surface_points`
 - `surface_diagnostics`
 - `runtime_metrics`
 
-## UI Payload Strategy
+## Reused Chart And Table Data
 
-The UI now uses a batch-scoped `PagePayloadCache` for scanner, model-vs-market, validation, calendar/density, and runtime-metrics pages.
+The UI now keeps cached prebuilt chart and table data for the selected saved snapshot on the scanner, model-vs-market, validation, calendar/density, and runtime-metrics pages.
 
-This keeps the rendering contract simple:
+This keeps the rendering rules simple:
 
-- one payload cache per window
-- cache invalidated on batch change
-- reused across control changes inside the same batch
+- one chart/table cache per window
+- clear the cache when the selected saved snapshot changes
+- reuse the same prepared chart data while the user changes controls inside that saved snapshot
 
-## Trust Model
+## Data-Quality Model
 
-The scanner does not invent a new trust stack. It reads the same validation backbone already used elsewhere:
+The scanner does not invent a separate quality stack. It reads the same validation backbone already used elsewhere:
 
-- quote eligibility and corridor behavior
-- within-bid/ask checks
+- quote eligibility and market bid/ask range behavior
+- checks that model prices stay inside bid/ask
 - strip-shape diagnostics
-- surface diagnostics
+- fitted-surface diagnostics
 - runtime freshness and latency
 
 ## Known Limits
 
 - Phase 1 is SPY-only.
-- `flow_proxy_points` are snapshot deltas, not tape-derived flow.
+- `flow_proxy_points` are changes between saved snapshots, not tape-derived flow.
 - The short-expiry scanner is optimized for current `yfinance` polling reality, not for exchange-tape semantics.

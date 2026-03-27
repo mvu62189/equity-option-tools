@@ -11,3 +11,4 @@ This tree captures how features were implemented, why certain tradeoffs were cho
 Current implementation records:
 
 - `spy-short-expiry-workstation/`
+- `batch-scoped-review-ssvi-trace/`

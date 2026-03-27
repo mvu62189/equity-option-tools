@@ -230,6 +230,42 @@ def implied_vol_bs2002_call(
         return float("nan"), False
 
 
+def implied_vol_bs2002_put(
+    target_price: float,
+    contract: AmericanContract,
+    divs: list[DividendEvent] | tuple[DividendEvent, ...] = (),
+    low: float = 1e-4,
+    high: float = 4.0,
+) -> tuple[float, bool]:
+    if quantcore is None or target_price <= 0.0 or contract.is_call:
+        return float("nan"), False
+
+    cpp_divs = _to_cpp_divs(divs)
+
+    def objective(sigma: float) -> float:
+        return float(
+            quantcore.bs2002_escrowed_put(
+                contract.spot,
+                contract.strike,
+                contract.tau,
+                contract.rate,
+                sigma,
+                cpp_divs,
+            )
+            - target_price
+        )
+
+    try:
+        f_low = objective(low)
+        f_high = objective(high)
+        if math.isnan(f_low) or math.isnan(f_high) or f_low * f_high > 0:
+            return float("nan"), False
+        iv = brentq(objective, low, high, maxiter=100, xtol=1e-7)
+        return float(iv), True
+    except Exception:
+        return float("nan"), False
+
+
 class O4IVEngine(Protocol):
     def estimate_eep(
         self,
@@ -255,19 +291,33 @@ class BjerksundStenslandEngine:
         divs: list[DividendEvent] | tuple[DividendEvent, ...] = (),
         force_zero_q: bool = False,
     ) -> AmericanIVDiagnostics:
-        if contract.is_call and quantcore is not None:
-            iv_cpp, ok_cpp = implied_vol_bs2002_call(market_price, contract, divs=divs)
+        if quantcore is not None:
+            iv_cpp, ok_cpp = (
+                implied_vol_bs2002_call(market_price, contract, divs=divs)
+                if contract.is_call
+                else implied_vol_bs2002_put(market_price, contract, divs=divs)
+            )
             if ok_cpp and not math.isnan(iv_cpp):
                 try:
                     cpp_divs = _to_cpp_divs(divs)
-                    price, _delta, _gamma, _theta, _vega, _rho = quantcore.bs2002_greeks_call(
-                        contract.spot,
-                        contract.strike,
-                        contract.tau,
-                        contract.rate,
-                        iv_cpp,
-                        cpp_divs,
-                    )
+                    if contract.is_call:
+                        price, _delta, _gamma, _theta, _vega, _rho = quantcore.bs2002_greeks_call(
+                            contract.spot,
+                            contract.strike,
+                            contract.tau,
+                            contract.rate,
+                            iv_cpp,
+                            cpp_divs,
+                        )
+                    else:
+                        price, _delta, _gamma, _theta, _vega, _rho = quantcore.bs2002_greeks_put(
+                            contract.spot,
+                            contract.strike,
+                            contract.tau,
+                            contract.rate,
+                            iv_cpp,
+                            cpp_divs,
+                        )
                     american_price = float(price)
                     european_price = price_euro_bs(
                         BSInput(
@@ -277,7 +327,7 @@ class BjerksundStenslandEngine:
                             dividend=contract.dividend,
                             tau=contract.tau,
                             vol=iv_cpp,
-                            is_call=True,
+                            is_call=contract.is_call,
                         )
                     ).price
                     eep = max(american_price - european_price, 0.0)

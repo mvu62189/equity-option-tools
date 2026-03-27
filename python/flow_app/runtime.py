@@ -475,6 +475,7 @@ def _run_ui_mode(launch: LaunchConfig, *, app: Any | None = None) -> int:
             ui_auto_degrade=config.ui_auto_degrade_enabled,
             refresh_callback=lambda: refresh_service.refresh_for_ui(launch.ticker).message,
             history_callback=refresh_service.load_chart_history,
+            history_error_callback=refresh_service.get_dataset_read_error,
             snapshot_timezone=config.snapshot_timezone,
             market_close_freeze_time=config.market_close_freeze_time,
             final_prices_refresh_time=config.final_prices_refresh_time,
@@ -485,6 +486,9 @@ def _run_ui_mode(launch: LaunchConfig, *, app: Any | None = None) -> int:
             bootstrap_message=bootstrap_msg,
             symbol_search_callback=symbol_search_callback,
             expiration_lookup_callback=expiration_lookup_callback,
+            batch_list_callback=refresh_service.list_available_batches,
+            batch_select_callback=refresh_service.hydrate_selected_snapshot,
+            pull_snapshot_callback=refresh_service.capture_full_snapshot_for_ui,
             live_expiration=live_selection.get_expiration(),
             live_expiration_setter=live_selection.set_expiration if launch.mode is AppMode.UI_LIVE else None,
             live_expiration_enabled=start_live,
@@ -531,6 +535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return run_launch_config(selected, app=app)
     return run_launch_config(initial)
+
 
 
 

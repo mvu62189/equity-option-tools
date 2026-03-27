@@ -172,19 +172,57 @@ class UIRefreshService:
         self._config = config
         self._loader = SnapshotBootstrapLoader(raw_root=config.parquet_root, derived_root=config.derived_parquet_root)
 
+    def get_dataset_read_error(self, dataset: str) -> str | None:
+        return self._loader.get_last_read_error(dataset)
+
+    def list_available_batches(self, symbol: str) -> pl.DataFrame:
+        return self._loader.list_symbol_batches(symbol)
+
     def hydrate_latest_snapshot(self, symbol: str) -> RefreshResult:
         payload = self._loader.load_latest_symbol_payload(symbol)
         if payload is None:
-            return RefreshResult(action="hydrate_missing", message="no stored snapshot found")
+            warning_keys = sorted(self._loader.get_last_read_errors())
+            suffix = f"; dataset read warnings={','.join(warning_keys)}" if warning_keys else ""
+            return RefreshResult(action="hydrate_missing", message=f"no stored snapshot found{suffix}")
         self._publish_bootstrap_payload(payload)
+        warning_keys = sorted(self._loader.get_last_read_errors())
+        warning_suffix = f"; dataset read warnings={','.join(warning_keys)}" if warning_keys else ""
         return RefreshResult(
             action="hydrate_latest",
             message=(
                 f"loaded stored snapshot kind={payload.snapshot_kind} "
-                f"trading_date={payload.trading_date or 'n/a'} batch={payload.batch_id}"
+                f"trading_date={payload.trading_date or 'n/a'} batch={payload.batch_id}{warning_suffix}"
             ),
             snapshot_kind=payload.snapshot_kind,
             source_mode=payload.source_mode,
+        )
+
+    def hydrate_selected_snapshot(self, symbol: str, batch_id: str) -> RefreshResult:
+        payload = self._loader.load_symbol_payload(symbol, batch_id=batch_id)
+        if payload is None:
+            return RefreshResult(action="hydrate_missing", message=f"no stored snapshot found for batch={batch_id}")
+        self._publish_bootstrap_payload(payload)
+        warning_keys = sorted(self._loader.get_last_read_errors())
+        warning_suffix = f"; dataset read warnings={','.join(warning_keys)}" if warning_keys else ""
+        return RefreshResult(
+            action="hydrate_selected",
+            message=(
+                f"loaded stored snapshot kind={payload.snapshot_kind} "
+                f"trading_date={payload.trading_date or 'n/a'} batch={payload.batch_id}{warning_suffix}"
+            ),
+            snapshot_kind=payload.snapshot_kind,
+            source_mode=payload.source_mode,
+        )
+
+    def capture_full_snapshot_for_ui(self, symbol: str) -> RefreshResult:
+        frame = asyncio.run(self._pipeline.capture_snapshot(symbol))
+        snapshot = self._cache.get_snapshot_nowait(symbol)
+        batch_id = snapshot.batch_id if snapshot is not None else ""
+        return RefreshResult(
+            action="capture_snapshot",
+            message=f"captured full snapshot rows={frame.height} batch={batch_id or 'n/a'}",
+            snapshot_kind=snapshot.snapshot_kind if snapshot is not None else "snapshot_once",
+            source_mode=snapshot.source_mode if snapshot is not None else "ui_review_capture",
         )
 
     def load_chart_history(self, symbol: str, dataset: str) -> pl.DataFrame:
@@ -309,7 +347,16 @@ class UIRefreshService:
     def _publish_bootstrap_payload(self, payload: BatchPayload) -> None:
         asyncio.run(self._cache.publish_batch(payload))
         self._cache.append_history(payload.symbol, "raw", payload.raw)
-        self._cache.append_history(payload.symbol, "greeks", payload.greeks)
+        if not payload.greeks.is_empty():
+            source_values = (
+                {str(value) for value in payload.greeks["greeks_source"].drop_nulls().to_list()}
+                if "greeks_source" in payload.greeks.columns
+                else set()
+            )
+            if source_values == {"model_greeks"}:
+                self._cache.append_history(payload.symbol, "model_greeks", payload.greeks)
+            else:
+                self._cache.append_history(payload.symbol, "greeks", payload.greeks)
         self._cache.append_history(payload.symbol, "ssvi", payload.ssvi)
         self._cache.append_history(payload.symbol, "dispatch", payload.dispatch)
         self._cache.append_history(payload.symbol, "parity", payload.parity)

@@ -608,7 +608,26 @@ def build_density_payload(
         }
 
     ordered = filt.select(["strike", "model_price"]).sort("strike")
+    ordered = ordered.group_by("strike").agg(pl.mean("model_price").alias("model_price")).sort("strike")
+    if ordered.height < 3:
+        return {
+            "line_series": {},
+            "meta": {
+                "status": "insufficient_unique_strikes",
+                "chart_explanation": "Risk-neutral density requires at least three unique strike points after consolidating duplicate strikes.",
+            },
+        }
+
     strikes = np.asarray(ordered["strike"].to_list(), dtype=np.float64)
+    if np.any(np.diff(strikes) <= 0.0):
+        return {
+            "line_series": {},
+            "meta": {
+                "status": "duplicate_strike_grid",
+                "chart_explanation": "Risk-neutral density is unavailable because the strike grid is not strictly increasing.",
+            },
+        }
+
     prices = np.asarray(ordered["model_price"].to_list(), dtype=np.float64)
     first = np.gradient(prices, strikes)
     second = np.gradient(first, strikes)
@@ -628,6 +647,269 @@ def build_density_payload(
     }
 
 
+
+
+
+def build_overlay_frame_payload(
+    frame: pl.DataFrame,
+    greek: str,
+    option_type: str,
+    expiry_filter: str,
+    *,
+    space_mode: str = "strike",
+    engine_mask: set[str] | None = None,
+    dual_mode: bool = False,
+    data_source: str = "greeks",
+) -> dict[str, Any]:
+    if frame.is_empty() or greek not in frame.columns:
+        payload = _empty_overlay("missing_greeks")
+        payload["meta"]["data_source"] = f"{data_source} (empty)"
+        return payload
+
+    filt = frame
+    if option_type != "all" and "option_type" in filt.columns:
+        filt = filt.filter(pl.col("option_type") == option_type)
+    if expiry_filter != "all" and "expiration" in filt.columns:
+        filt = filt.filter(pl.col("expiration").cast(pl.String) == expiry_filter)
+    if engine_mask:
+        engine_col = "engine_used" if "engine_used" in filt.columns else "greeks_engine"
+        if engine_col in filt.columns:
+            filt = filt.filter(pl.col(engine_col).is_in(sorted(engine_mask)))
+    if "expiration" not in filt.columns:
+        filt = filt.with_columns(pl.lit("all").alias("expiration"))
+
+    required = {"strike", greek}
+    if not required.issubset(set(filt.columns)):
+        payload = _empty_overlay("missing_columns")
+        payload["meta"]["data_source"] = data_source
+        return payload
+    filt = filt.filter(pl.col("strike").is_not_null() & pl.col(greek).is_not_null() & pl.col(greek).is_finite())
+    if filt.is_empty():
+        payload = _empty_overlay("filtered_empty")
+        payload["meta"]["data_source"] = data_source
+        return payload
+
+    forward = float(filt["underlying_price"][0]) if "underlying_price" in filt.columns else 1.0
+    engine_col = "engine_used" if "engine_used" in filt.columns else "greeks_engine"
+    line_series: dict[str, np.ndarray] = {}
+    engine_values = sorted({str(x) for x in filt[engine_col].drop_nulls().to_list()}) if engine_col in filt.columns else []
+    partition_cols = [c for c in ("option_type", engine_col) if c in filt.columns]
+    if partition_cols:
+        for group_key, sub in filt.partition_by(partition_cols, as_dict=True).items():
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            name = ":".join(str(part) for part in group_key if str(part))
+            pts = sub.select(["strike", greek]).sort("strike")
+            x = _x_transform(np.asarray(pts["strike"].to_list(), dtype=np.float32), forward=forward, space_mode=space_mode)
+            y = np.asarray(pts[greek].to_list(), dtype=np.float32)
+            line_series[name] = np.ascontiguousarray(np.column_stack([x, y]), dtype=np.float32)
+
+    heat_frame = filt
+    heat_status = "ok"
+    if option_type == "all" and "option_type" in filt.columns:
+        option_values = sorted({str(x) for x in filt["option_type"].drop_nulls().to_list()})
+        if len(option_values) > 1:
+            heat_frame = filt.filter(pl.col("option_type") == option_values[0])
+            heat_status = f"heatmap_single_option:{option_values[0]}"
+    if len(engine_values) > 1 and engine_col in filt.columns:
+        heat_frame = filt.filter(pl.col(engine_col) == engine_values[0])
+        heat_status = f"heatmap_single_engine:{engine_values[0]}"
+
+    if space_mode == "residual" and "space_mode" in heat_frame.columns:
+        left = heat_frame.filter(pl.col("space_mode") == "log").group_by(["expiration", "strike"]).agg(pl.mean(greek).alias("log_val"))
+        right = heat_frame.filter(pl.col("space_mode") == "strike").group_by(["expiration", "strike"]).agg(pl.mean(greek).alias("strike_val"))
+        joined = left.join(right, on=["expiration", "strike"], how="inner")
+        if joined.is_empty():
+            payload = _empty_overlay("residual_empty")
+            payload["meta"]["data_source"] = data_source
+            return payload
+        heat_frame = joined.with_columns((pl.col("strike_val") - pl.col("log_val")).alias(greek))
+
+    mat, strike_vals, exp_unique, y_vals = _grid_from_frame(heat_frame.rename({greek: "_value"}), "_value")
+    mat = np.ascontiguousarray(mat, dtype=np.float32)
+    levels = _robust_levels(mat)
+    x_vals = np.asarray(strike_vals, dtype=np.float32)
+    if space_mode == "log":
+        x_vals = _x_transform(x_vals, forward=forward, space_mode=space_mode)
+    x_min = float(np.min(x_vals))
+    x_max = float(np.max(x_vals))
+    y_min = float(min(y_vals)) if y_vals else 0.0
+    y_max = float(max(y_vals)) if y_vals else 0.0
+    payload = {
+        "line_series": line_series,
+        "heat_image": mat,
+        "rect": (x_min, y_min - 0.5 if len(y_vals) <= 1 else y_min, max(x_max - x_min, 1e-6), 1.0 if len(y_vals) <= 1 else max(y_max - y_min, 1.0)),
+        "levels": levels,
+        "meta": {
+            "status": heat_status,
+            "rows": int(filt.height),
+            "space_mode": space_mode,
+            "payload_bytes": int(mat.nbytes + sum(arr.nbytes for arr in line_series.values())),
+            "y_axis_mode": "days_to_expiry",
+            "y_axis_values": [float(x) for x in y_vals],
+            "y_axis_labels": [str(x) for x in exp_unique],
+            "is_single_expiry": len(exp_unique) <= 1,
+            "expiries_loaded": exp_unique,
+            "chart_explanation": f"Overlay of {data_source} against strike/log-moneyness for the selected scope.",
+            "data_source": data_source,
+            "heat_engine": engine_values[0] if engine_values else "",
+        },
+    }
+    if dual_mode:
+        payload["heat_image_alt"] = mat.copy()
+        payload["rect_alt"] = payload["rect"]
+    return payload
+
+
+def build_processing_trace_payload(
+    frame: pl.DataFrame,
+    *,
+    option_type: str,
+    expiry_filter: str,
+) -> dict[str, Any]:
+    latest = _latest_batch_frame(frame)
+    if latest.is_empty():
+        return {"panels": {}, "meta": {"status": "missing_surface_points", "chart_explanation": "No surface rows are available for processing trace."}}
+
+    filt = latest
+    expiry_choice = expiry_filter
+    if "expiration" in filt.columns and expiry_choice == "all":
+        expiries = sorted({str(x) for x in filt["expiration"].to_list() if x is not None})
+        expiry_choice = expiries[0] if expiries else "all"
+    if "expiration" in filt.columns and expiry_choice != "all":
+        filt = filt.filter(pl.col("expiration").cast(pl.String) == expiry_choice)
+    if option_type != "all" and "option_type" in filt.columns:
+        filt = filt.filter(pl.col("option_type") == option_type)
+    if filt.is_empty():
+        return {"panels": {}, "meta": {"status": "filtered_empty", "chart_explanation": "No rows survived the selected expiry/option filter."}}
+
+    def panel_series(
+        frame_: pl.DataFrame,
+        field_map: dict[str, str],
+        *,
+        filter_expr=None,
+    ) -> dict[str, np.ndarray]:
+        sub = frame_.filter(filter_expr) if filter_expr is not None else frame_
+        out: dict[str, np.ndarray] = {}
+        if sub.is_empty() or "strike" not in sub.columns:
+            return out
+        groups = sub.partition_by([c for c in ("option_type",) if c in sub.columns], as_dict=True) if "option_type" in sub.columns else {("series",): sub}
+        for key, group in groups.items():
+            prefix = ":".join(str(part) for part in (key if isinstance(key, tuple) else (key,)))
+            ordered = group.sort("strike")
+            strikes = np.asarray(ordered["strike"].to_list(), dtype=np.float32)
+            for field, label in field_map.items():
+                if field not in ordered.columns:
+                    continue
+                values = np.asarray(ordered[field].to_list(), dtype=np.float32)
+                out[f"{prefix}:{label}"] = np.ascontiguousarray(np.column_stack([strikes, values]), dtype=np.float32)
+        return out
+
+    dropped = filt.filter(pl.col("drop_reason").cast(pl.String).str.len_chars() > 0) if "drop_reason" in filt.columns else pl.DataFrame()
+    fit_excluded = (
+        filt.filter(pl.col("eligible_for_fit") == False)
+        if "eligible_for_fit" in filt.columns
+        else pl.DataFrame()
+    )
+    processing = {
+        "cleaning": {
+            "line_series": {
+                **panel_series(filt, {"bid": "raw_bid", "ask": "raw_ask"}),
+                **panel_series(
+                    filt,
+                    {"bid": "clean_bid", "ask": "clean_ask"},
+                    filter_expr=pl.col("eligible_prestrip") == True,
+                ),
+                **panel_series(
+                    dropped.with_columns(pl.col("market_mid").alias("dropped_mid")),
+                    {"dropped_mid": "dropped_mid"},
+                ),
+            },
+            "title": "Cleaning",
+        },
+        "deamericanization": {
+            "line_series": {
+                **panel_series(
+                    filt,
+                    {"bid": "clean_bid", "ask": "clean_ask"},
+                    filter_expr=pl.col("eligible_prestrip") == True,
+                ),
+                **panel_series(
+                    filt,
+                    {
+                        "euro_price_bid": "euro_bid",
+                        "euro_price_ask": "euro_ask",
+                        "euro_price_ref": "euro_ref",
+                    },
+                ),
+            },
+            "title": "De-Americanization",
+        },
+        "vol_fit": {
+            "line_series": panel_series(
+                filt,
+                {
+                    "iv_bid": "iv_bid",
+                    "iv_ask": "iv_ask",
+                    "iv_ref": "iv_ref",
+                    "ssvi_vol": "ssvi_vol",
+                },
+            ),
+            "title": "Vol Fit Corridor",
+        },
+        "vol_diag": {
+            "line_series": {
+                **panel_series(
+                    filt,
+                    {
+                        "iv_bid": "iv_bid",
+                        "iv_ask": "iv_ask",
+                        "iv_ref": "iv_ref",
+                        "ssvi_vol": "ssvi_vol",
+                        "vendor_iv_ref": "vendor_iv_ref",
+                    },
+                ),
+                **panel_series(
+                    fit_excluded.with_columns(pl.col("iv_ref").alias("excluded_iv_ref")),
+                    {"excluded_iv_ref": "excluded_iv_ref"},
+                ),
+            },
+            "title": "Full Vol Diagnostic",
+        },
+        "euro_reprice": {
+            "line_series": panel_series(
+                filt,
+                {
+                    "euro_price_bid": "euro_bid",
+                    "euro_price_ask": "euro_ask",
+                    "euro_price_ref": "euro_ref",
+                    "ssvi_euro_price": "ssvi_euro_price",
+                },
+            ),
+            "title": "European Reprice",
+        },
+        "american_reprice": {
+            "line_series": panel_series(
+                filt,
+                {
+                    "bid": "clean_bid",
+                    "ask": "clean_ask",
+                    "market_mid": "market_mid",
+                    "ssvi_american_price": "ssvi_american_price",
+                },
+            ),
+            "title": "American Reprice",
+        },
+    }
+    return {
+        "panels": processing,
+        "meta": {
+            "status": "ok",
+            "selected_expiry": expiry_choice,
+            "rows": int(filt.height),
+            "chart_explanation": "Trace the batch-scoped processing path from cleaned American prices through de-Americanization, SSVI fit validation, and American repricing.",
+        },
+    }
 def build_calendar_payload(frame: pl.DataFrame, *, option_type: str) -> dict[str, Any]:
     latest = _latest_batch_frame(frame)
     if latest.is_empty():

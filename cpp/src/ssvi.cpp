@@ -24,43 +24,147 @@ inline bool finite_vec(const std::vector<double>& v) {
   return true;
 }
 
-inline bool durrleman_pass(double b, double rho, double sigma) {
-  return b > 0.0 && sigma > 0.0 && std::abs(rho) < 1.0 && b * (1.0 + std::abs(rho)) <= 4.0;
+inline bool is_log_fit_space(const std::string& fit_space) {
+  return fit_space != "strike";
 }
 
-inline std::vector<double> to_log_moneyness(
+inline bool durrleman_pass(double b, double rho, double sigma, bool log_fit_space) {
+  if (b <= 0.0 || sigma <= 0.0 || std::abs(rho) >= 1.0) {
+    return false;
+  }
+  if (log_fit_space) {
+    return b * (1.0 + std::abs(rho)) <= 4.0;
+  }
+  return b <= 20.0;
+}
+
+inline double durrleman_penalty(double b, double rho, double sigma, bool log_fit_space) {
+  if (b <= 0.0 || sigma <= 0.0 || std::abs(rho) >= 1.0) {
+    return 1e3;
+  }
+  if (log_fit_space) {
+    if (b * (1.0 + std::abs(rho)) > 4.0) {
+      return (b * (1.0 + std::abs(rho)) - 4.0) * 1e3;
+    }
+    return 0.0;
+  }
+  if (b > 20.0) {
+    return (b - 20.0) * 1e2;
+  }
+  return 0.0;
+}
+
+inline std::vector<double> to_coordinate(
     const std::vector<double>& strikes,
-    double forward) {
+    double forward,
+    bool log_fit_space) {
   std::vector<double> out;
   out.reserve(strikes.size());
   const double fwd = std::max(forward, 1e-8);
   for (double k : strikes) {
-    out.push_back(std::log(std::max(k, 1e-8) / fwd));
+    const double strike = std::max(k, 1e-8);
+    if (log_fit_space) {
+      out.push_back(std::log(strike / fwd));
+    } else {
+      out.push_back((strike - fwd) / fwd);
+    }
   }
   return out;
 }
 
-inline double ssvi_sse(
-    const std::vector<double>& x,
-    const std::vector<double>& target_w,
-    const std::vector<double>& weights,
-    double tau,
+inline double ssvi_total_variance_at(
+    double coord,
     double a,
     double b,
     double rho,
     double m,
     double sigma) {
-  (void)tau;
   const double sig = std::max(sigma, 1e-8);
-  double sse = 0.0;
-  for (std::size_t i = 0; i < x.size(); ++i) {
-    const double xm = x[i] - m;
-    const double w = a + b * (rho * xm + std::sqrt(xm * xm + sig * sig));
-    const double diff = w - target_w[i];
+  const double xm = coord - m;
+  return a + b * (rho * xm + std::sqrt(xm * xm + sig * sig));
+}
+
+struct SsviObjectiveMetrics {
+  double objective;
+  double sse;
+};
+
+inline std::vector<double> ssvi_residual_vector(
+    const std::vector<double>& coord,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
+    double tau,
+    bool has_corridor,
+    bool log_fit_space,
+    double a,
+    double b,
+    double rho,
+    double m,
+    double sigma) {
+  const double tau_eff = std::max(tau, 1e-12);
+  std::vector<double> residuals;
+  residuals.reserve(coord.size() + 1U);
+  for (std::size_t i = 0; i < coord.size(); ++i) {
     const double weight = (i < weights.size() && std::isfinite(weights[i]) && weights[i] > 0.0) ? weights[i] : 1.0;
-    sse += weight * diff * diff;
+    const double model_w = std::max(ssvi_total_variance_at(coord[i], a, b, rho, m, sigma), 1e-12);
+    double residual = 0.0;
+    if (has_corridor) {
+      const double lower = iv_lower[i];
+      const double upper = iv_upper[i];
+      const double target = ivs[i];
+      const double model_vol = std::sqrt(model_w / tau_eff);
+      const double corridor_scale = std::max(upper - lower, 1e-4);
+      const double below = std::max(lower - model_vol, 0.0) / corridor_scale;
+      const double above = std::max(model_vol - upper, 0.0) / corridor_scale;
+      const double outside = 4.0 * (below + above);
+      const double weak_guide = 0.05 * (model_vol - target) / corridor_scale;
+      residual = std::sqrt(weight) * (outside + weak_guide);
+    } else {
+      const double target_w = std::max(ivs[i], 1e-8) * std::max(ivs[i], 1e-8) * tau_eff;
+      residual = std::sqrt(weight) * (model_w - target_w);
+    }
+    residuals.push_back(residual);
   }
-  return sse;
+  residuals.push_back(durrleman_penalty(b, rho, sigma, log_fit_space));
+  return residuals;
+}
+
+inline SsviObjectiveMetrics ssvi_objective(
+    const std::vector<double>& coord,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
+    double tau,
+    bool has_corridor,
+    bool log_fit_space,
+    double a,
+    double b,
+    double rho,
+    double m,
+    double sigma) {
+  const auto residuals = ssvi_residual_vector(
+      coord,
+      ivs,
+      weights,
+      iv_lower,
+      iv_upper,
+      tau,
+      has_corridor,
+      log_fit_space,
+      a,
+      b,
+      rho,
+      m,
+      sigma);
+  double sse = 0.0;
+  for (double residual : residuals) {
+    sse += residual * residual;
+  }
+  const double denom = static_cast<double>(residuals.size());
+  return {.objective = sse / std::max(denom, 1.0), .sse = sse};
 }
 
 inline double median_forward_guess(const std::vector<double>& strikes) {
@@ -74,12 +178,15 @@ inline double median_forward_guess(const std::vector<double>& strikes) {
 
 }  // namespace
 
-SsviCalibrationResult calibrate_ssvi_log_slice(
+SsviCalibrationResult calibrate_ssvi_slice(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
     const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
     double forward,
     double tau,
+    const std::string& fit_space,
     const std::map<std::string, double>& init_guess,
     const std::map<std::string, double>& constraints) {
   SsviCalibrationResult out{
@@ -88,6 +195,7 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
       .rho = init_guess.count("rho") ? init_guess.at("rho") : -0.20,
       .m = init_guess.count("m") ? init_guess.at("m") : 0.0,
       .sigma = init_guess.count("sigma") ? init_guess.at("sigma") : 0.25,
+      .objective = std::numeric_limits<double>::infinity(),
       .sse = std::numeric_limits<double>::infinity(),
       .iterations = 0,
       .converged = false,
@@ -107,34 +215,37 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
     out.reason = "weight_size_mismatch";
     return out;
   }
+  const bool has_corridor = !iv_lower.empty() || !iv_upper.empty();
+  if (has_corridor && (iv_lower.size() != strikes.size() || iv_upper.size() != strikes.size())) {
+    out.reason = "corridor_size_mismatch";
+    return out;
+  }
   if (!finite_vec(strikes) || !finite_vec(ivs)) {
     out.reason = "nonfinite_input";
     return out;
   }
-
-  const double tau_eff = std::max(tau, 1e-6);
-  const auto x = to_log_moneyness(strikes, forward);
-  std::vector<double> target_w;
-  target_w.reserve(ivs.size());
-  for (double iv : ivs) {
-    const double vol = std::max(iv, 1e-6);
-    target_w.push_back(vol * vol * tau_eff);
+  if (has_corridor && (!finite_vec(iv_lower) || !finite_vec(iv_upper))) {
+    out.reason = "nonfinite_corridor";
+    return out;
   }
+
+  const bool log_fit_space = is_log_fit_space(fit_space);
+  const double tau_eff = std::max(tau, 1e-6);
+  const auto coord = to_coordinate(strikes, forward, log_fit_space);
 
   const int max_iter = constraints.count("max_iter") ? std::max(static_cast<int>(constraints.at("max_iter")), 32) : 240;
   const double tol = constraints.count("tol") ? std::max(constraints.at("tol"), 1e-12) : 1e-9;
 
-  // box constraints
-  constexpr double a_lo = -5.0;
-  constexpr double a_hi = 5.0;
-  constexpr double b_lo = 1e-6;
-  constexpr double b_hi = 12.0;
-  constexpr double rho_lo = -0.999;
-  constexpr double rho_hi = 0.999;
-  constexpr double m_lo = -6.0;
-  constexpr double m_hi = 6.0;
-  constexpr double sig_lo = 1e-6;
-  constexpr double sig_hi = 5.0;
+  const double a_lo = -5.0;
+  const double a_hi = 5.0;
+  const double b_lo = constraints.count("b_min") ? std::max(constraints.at("b_min"), 1e-8) : 1e-6;
+  const double b_hi = 10.0;
+  const double rho_lo = constraints.count("rho_min") ? constraints.at("rho_min") : -0.999;
+  const double rho_hi = constraints.count("rho_max") ? constraints.at("rho_max") : 0.999;
+  const double m_lo = -5.0;
+  const double m_hi = 5.0;
+  const double sig_lo = constraints.count("sigma_min") ? std::max(constraints.at("sigma_min"), 1e-8) : 1e-6;
+  const double sig_hi = 5.0;
 
   double a = clamp(out.a, a_lo, a_hi);
   double b = clamp(out.b, b_lo, b_hi);
@@ -162,9 +273,24 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
     value *= scale;
   }
 
-  double best = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
+  auto best_metrics = ssvi_objective(
+      coord,
+      ivs,
+      use_weights,
+      iv_lower,
+      iv_upper,
+      tau_eff,
+      has_corridor,
+      log_fit_space,
+      a,
+      b,
+      rho,
+      m,
+      sigma);
+  double best = best_metrics.objective;
   double prev_best = best;
   std::vector<double> step = {0.08, 0.10, 0.04, 0.10, 0.08};
+  bool stopped_by_tol = false;
 
   for (int iter = 0; iter < max_iter; ++iter) {
     bool improved = false;
@@ -203,20 +329,48 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
 
       const double up = clamp(base + step[p], lo, hi);
       *var = up;
-      const double sse_up = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
+      const double obj_up = ssvi_objective(
+          coord,
+          ivs,
+          use_weights,
+          iv_lower,
+          iv_upper,
+          tau_eff,
+          has_corridor,
+          log_fit_space,
+          a,
+          b,
+          rho,
+          m,
+          sigma)
+                                .objective;
 
       const double dn = clamp(base - step[p], lo, hi);
       *var = dn;
-      const double sse_dn = ssvi_sse(x, target_w, use_weights, tau_eff, a, b, rho, m, sigma);
+      const double obj_dn = ssvi_objective(
+          coord,
+          ivs,
+          use_weights,
+          iv_lower,
+          iv_upper,
+          tau_eff,
+          has_corridor,
+          log_fit_space,
+          a,
+          b,
+          rho,
+          m,
+          sigma)
+                                .objective;
 
       *var = base;
-      if (sse_up < best && sse_up <= sse_dn) {
+      if (obj_up < best && obj_up <= obj_dn) {
         *var = up;
-        best = sse_up;
+        best = obj_up;
         improved = true;
-      } else if (sse_dn < best) {
+      } else if (obj_dn < best) {
         *var = dn;
-        best = sse_dn;
+        best = obj_dn;
         improved = true;
       }
     }
@@ -229,20 +383,37 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
     }
     const double max_step = *std::max_element(step.begin(), step.end());
     if (max_step < tol || std::abs(prev_best - best) < tol) {
+      stopped_by_tol = true;
       break;
     }
     prev_best = best;
   }
+
+  const auto final_metrics = ssvi_objective(
+      coord,
+      ivs,
+      use_weights,
+      iv_lower,
+      iv_upper,
+      tau_eff,
+      has_corridor,
+      log_fit_space,
+      a,
+      b,
+      rho,
+      m,
+      sigma);
 
   out.a = a;
   out.b = b;
   out.rho = rho;
   out.m = m;
   out.sigma = sigma;
-  out.sse = best;
-  out.durrleman = durrleman_pass(b, rho, sigma);
-  out.converged = std::isfinite(best) && out.durrleman && out.iterations > 0;
-  if (!std::isfinite(best)) {
+  out.objective = final_metrics.objective;
+  out.sse = final_metrics.sse;
+  out.durrleman = durrleman_pass(b, rho, sigma, log_fit_space);
+  out.converged = std::isfinite(final_metrics.objective) && stopped_by_tol;
+  if (!std::isfinite(final_metrics.objective)) {
     out.reason = "nonfinite_objective";
   } else if (!out.durrleman) {
     out.reason = "durrleman_violation";
@@ -252,6 +423,68 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
     out.reason = "max_iterations";
   }
   return out;
+}
+
+SsviCalibrationResult calibrate_ssvi_log_slice(
+    const std::vector<double>& strikes,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    double forward,
+    double tau,
+    const std::map<std::string, double>& init_guess,
+    const std::map<std::string, double>& constraints) {
+  return calibrate_ssvi_slice(
+      strikes,
+      ivs,
+      weights,
+      {},
+      {},
+      forward,
+      tau,
+      "log",
+      init_guess,
+      constraints);
+}
+
+std::vector<double> ssvi_residuals_slice(
+    const std::vector<double>& strikes,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
+    double forward,
+    double tau,
+    const std::string& fit_space,
+    const std::vector<double>& params) {
+  if (strikes.size() != ivs.size()) {
+    return {};
+  }
+  if (!weights.empty() && weights.size() != strikes.size()) {
+    return {};
+  }
+  const bool has_corridor = !iv_lower.empty() || !iv_upper.empty();
+  if (has_corridor && (iv_lower.size() != strikes.size() || iv_upper.size() != strikes.size())) {
+    return {};
+  }
+  if (params.size() < 5U) {
+    return {};
+  }
+  const bool log_fit_space = is_log_fit_space(fit_space);
+  const auto coord = to_coordinate(strikes, forward, log_fit_space);
+  return ssvi_residual_vector(
+      coord,
+      ivs,
+      weights,
+      iv_lower,
+      iv_upper,
+      tau,
+      has_corridor,
+      log_fit_space,
+      params[0],
+      params[1],
+      params[2],
+      params[3],
+      params[4]);
 }
 
 std::map<std::string, double> calibrate_ssvi(

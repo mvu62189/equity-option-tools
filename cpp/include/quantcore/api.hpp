@@ -15,6 +15,7 @@ struct SsviCalibrationResult {
   double rho;
   double m;
   double sigma;
+  double objective;
   double sse;
   std::size_t iterations;
   bool converged;
@@ -32,6 +33,18 @@ struct FdmCnLogResult {
   std::string reason;
 };
 
+SsviCalibrationResult calibrate_ssvi_slice(
+    const std::vector<double>& strikes,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
+    double forward,
+    double tau,
+    const std::string& fit_space,
+    const std::map<std::string, double>& init_guess,
+    const std::map<std::string, double>& constraints);
+
 SsviCalibrationResult calibrate_ssvi_log_slice(
     const std::vector<double>& strikes,
     const std::vector<double>& ivs,
@@ -40,6 +53,17 @@ SsviCalibrationResult calibrate_ssvi_log_slice(
     double tau,
     const std::map<std::string, double>& init_guess,
     const std::map<std::string, double>& constraints);
+
+std::vector<double> ssvi_residuals_slice(
+    const std::vector<double>& strikes,
+    const std::vector<double>& ivs,
+    const std::vector<double>& weights,
+    const std::vector<double>& iv_lower,
+    const std::vector<double>& iv_upper,
+    double forward,
+    double tau,
+    const std::string& fit_space,
+    const std::vector<double>& params);
 
 std::map<std::string, double> calibrate_ssvi(
     const std::vector<double>& strikes,

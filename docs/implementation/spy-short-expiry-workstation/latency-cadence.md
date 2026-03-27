@@ -1,21 +1,21 @@
 # Latency And Cadence
 
-## Default Cadence
+## Default Refresh Intervals
 
-- hot focused cadence: `15s`
-- full-surface cadence: `300s`
+- focused short-expiry refresh: `15s`
+- full-surface refresh: `300s`
 
-## Backoff
+## Slower Fallback
 
-The worker backs off when:
+The worker slows down when:
 
 - repeated fetch failures accumulate
-- recent fetch latency becomes too large relative to the hot cadence
+- recent fetch latency becomes too large relative to the fast short-expiry refresh
 
-Current backoff caps:
+Current fallback caps:
 
-- hot cadence: `30s`
-- full-surface cadence: `600s`
+- focused short-expiry refresh: `30s`
+- full-surface refresh: `600s`
 
 ## Why This Shape
 
@@ -27,10 +27,10 @@ The current provider is snapshot-oriented, not tape-oriented. That leads to a de
 
 ## UI Latency Work
 
-The biggest shipped UI latency improvement in this feature is payload reuse:
+The biggest shipped UI latency improvement in this feature is reuse of prebuilt chart and table data:
 
-- build once per batch
+- build once per saved snapshot
 - reuse while the user changes controls
-- invalidate only when a new batch arrives
+- clear only when a new saved snapshot arrives
 
-This is lower-risk than redesigning the Qt plus asyncio topology and aligns better with the current pipeline.
+This is lower-risk than redesigning the Qt plus asyncio topology and matches the current pipeline better.

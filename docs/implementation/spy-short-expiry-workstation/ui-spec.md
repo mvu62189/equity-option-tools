@@ -2,23 +2,23 @@
 
 ## Layout
 
-The workstation is now organized into three practical layers:
+The workstation is organized into three practical layers:
 
 - `Scanner`: landing page for `0DTE`, `1DTE`, and `EOW`
-- `Drilldown`: existing detailed tabs
-- `Validation`: existing trust and diagnostics tabs
+- `Drilldown`: existing detailed review tabs
+- `Validation`: existing data-quality, calibration, and diagnostics tabs
 
 ## Scanner Page
 
 Visible sections:
 
-- status line with selected focus bucket, trust, and snapshot age
-- runtime badge with current live cadence and fetch scope
+- status line with selected focus bucket, data-quality status, and snapshot age
+- runtime badge with current live refresh interval and fetch scope
 - three expiry cards: `0DTE`, `1DTE`, `EOW`
 - strike heatmap using gamma-OI exposure
 - focused-expiry summary table
 - scanner levels table
-- flow proxy table
+- snapshot-to-snapshot activity table
 
 ## Interaction Rules
 
@@ -30,13 +30,13 @@ Visible sections:
 
 - `option_type=all` keeps call and put lines separate.
 - Single-expiry contexts hide redundant expiry heatmaps.
-- Price-fit views compare quoted American `bid/ask/mid` to `american_model_price`.
-- Flow rows remain labeled as proxy analytics.
+- Price-fit views compare market American `bid`, `ask`, and `mid` with the American model price.
+- Activity rows remain labeled as estimates inferred from snapshot changes.
 
 ## Styling Direction
 
-- Keep the app’s existing white/light debug-workstation visual language.
-- Use color-coded trust cards:
+- Keep the app's existing white/light debug-workstation visual language.
+- Use color-coded data-quality cards:
   - green for `trusted`
   - amber for `review`
   - red for `caution`

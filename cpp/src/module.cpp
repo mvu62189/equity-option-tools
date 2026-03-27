@@ -58,6 +58,58 @@ PYBIND11_MODULE(quantcore, m) {
   m.doc() = "quantcore C++ bindings";
 
   m.def(
+      "calibrate_ssvi_slice",
+      [](const std::vector<double>& strikes,
+         const std::vector<double>& ivs,
+         const std::vector<double>& weights,
+         const std::vector<double>& iv_lower,
+         const std::vector<double>& iv_upper,
+         double forward,
+         double tau,
+         const std::string& fit_space,
+         const std::map<std::string, double>& init_guess,
+         const std::map<std::string, double>& constraints) {
+        quantcore::SsviCalibrationResult fit;
+        {
+          py::gil_scoped_release release;
+          fit = quantcore::calibrate_ssvi_slice(
+              strikes, ivs, weights, iv_lower, iv_upper, forward, tau, fit_space, init_guess, constraints);
+        }
+        py::dict out;
+        py::list p;
+        p.append(fit.a);
+        p.append(fit.b);
+        p.append(fit.rho);
+        p.append(fit.m);
+        p.append(fit.sigma);
+        out["params"] = p;
+        out["iterations"] = fit.iterations;
+        out["objective"] = fit.objective;
+        out["sse"] = fit.sse;
+        out["converged"] = fit.converged;
+        out["durrleman"] = fit.durrleman;
+        out["reason"] = fit.reason;
+        out["fit_space"] = fit_space;
+        out["has_corridor"] = !iv_lower.empty() && !iv_upper.empty();
+        return out;
+      });
+
+  m.def(
+      "ssvi_residuals_slice",
+      [](const std::vector<double>& strikes,
+         const std::vector<double>& ivs,
+         const std::vector<double>& weights,
+         const std::vector<double>& iv_lower,
+         const std::vector<double>& iv_upper,
+         double forward,
+         double tau,
+         const std::string& fit_space,
+         const std::vector<double>& params) {
+        py::gil_scoped_release release;
+        return quantcore::ssvi_residuals_slice(strikes, ivs, weights, iv_lower, iv_upper, forward, tau, fit_space, params);
+      });
+
+  m.def(
       "calibrate_ssvi_log_slice",
       [](const std::vector<double>& strikes,
          const std::vector<double>& ivs,
@@ -80,6 +132,7 @@ PYBIND11_MODULE(quantcore, m) {
         p.append(fit.sigma);
         out["params"] = p;
         out["iterations"] = fit.iterations;
+        out["objective"] = fit.objective;
         out["sse"] = fit.sse;
         out["converged"] = fit.converged;
         out["durrleman"] = fit.durrleman;
@@ -113,6 +166,7 @@ PYBIND11_MODULE(quantcore, m) {
         p.append(fit.sigma);
         out["params"] = p;
         out["iterations"] = fit.iterations;
+        out["objective"] = fit.objective;
         out["sse"] = fit.sse;
         out["converged"] = fit.converged;
         out["durrleman"] = fit.durrleman;

@@ -125,6 +125,8 @@ def _dual_delta_from_price(prices: np.ndarray, strikes: np.ndarray, option_type:
         return np.asarray([], dtype=np.float64)
     if prices.size == 1:
         return np.asarray([0.0], dtype=np.float64)
+    if strikes.size != np.unique(strikes).size or np.any(np.diff(strikes) <= 0.0):
+        return np.full_like(prices, np.nan, dtype=np.float64)
     d_price = np.gradient(prices, strikes)
     return _option_sign(option_type) * d_price
 
@@ -254,12 +256,18 @@ def _prepare_row(
             "dual_delta_ref": float("nan"),
             "price_second_derivative_ref": float("nan"),
             "corridor_tightness": float("nan"),
+            "corridor_width": float("nan"),
             "weight_uniform": 1.0,
             "weight_atm": _atm_weight(log_moneyness),
             "weight_corridor_tightness": float("nan"),
             "weight_atm_corridor_tightness": float("nan"),
             "strip_shape_fail": False,
             "strip_shape_reason": "",
+            "fit_region": "unknown",
+            "is_atm_blend": False,
+            "blend_source": "",
+            "eligible_for_fit": False,
+            "excluded_from_fit_reason": "",
         }
     )
     if out["nonfinite_market"]:
@@ -302,6 +310,7 @@ def _prepare_row(
     ):
         out["drop_reason"] = "euro_strip_invalid"
         return out
+    out["corridor_width"] = max(float(out["iv_ask"]) - float(out["iv_bid"]), 1e-6)
     out["eligible_prestrip"] = True
     return out
 
@@ -343,6 +352,14 @@ def _apply_strip_reference(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         eligible.sort(key=lambda item: _to_float(item.get("strike")))
         strikes = np.asarray([_to_float(row.get("strike")) for row in eligible], dtype=np.float64)
+        if strikes.size != np.unique(strikes).size or np.any(np.diff(strikes) <= 0.0):
+            for row in eligible:
+                row["strip_shape_fail"] = True
+                row["strip_shape_reason"] = "duplicate_strike_grid"
+                if not row.get("drop_reason"):
+                    row["drop_reason"] = "duplicate_strike_grid"
+                row["eligible"] = False
+            continue
         euro_bid = np.asarray([_to_float(row.get("euro_price_bid")) for row in eligible], dtype=np.float64)
         euro_ask = np.asarray([_to_float(row.get("euro_price_ask")) for row in eligible], dtype=np.float64)
         option_type = str(eligible[0].get("option_type", "call")).lower()
@@ -403,6 +420,7 @@ def _apply_strip_reference(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["euro_price_ref"] = float(price_ref[idx])
             row["iv_ref"] = float(iv_ref)
             row["corridor_tightness"] = float(1.0 / corridor_width[idx])
+            row["corridor_width"] = float(corridor_width[idx])
             row["weight_corridor_tightness"] = float(corridor_weights[idx])
             row["weight_atm_corridor_tightness"] = float(corridor_weights[idx] * _to_float(row.get("weight_atm"), 0.0))
             row["strip_shape_fail"] = bool(shape_fail or not _is_finite(iv_ref) or second_ref[idx] < -1e-6)
@@ -414,45 +432,178 @@ def _apply_strip_reference(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _build_calibration_input(points: pl.DataFrame) -> pl.DataFrame:
+def _forward_price(row: dict[str, Any]) -> float:
+    spot = _to_float(row.get("underlying_price"))
+    rate = _to_float(row.get("rate_used"), 0.0)
+    tau = _to_float(row.get("tau_years"), 0.0)
+    if not (_is_finite(spot) and spot > 0.0 and _is_finite(rate) and _is_finite(tau) and tau > 0.0):
+        return float("nan")
+    return float(spot * math.exp(rate * tau))
+
+
+def _fit_region(row: dict[str, Any], forward: float, atm_strikes: set[float]) -> str:
+    strike = _to_float(row.get("strike"))
+    option_type = str(row.get("option_type", "")).lower()
+    if not math.isfinite(strike) or not math.isfinite(forward):
+        return "unknown"
+    if any(abs(strike - atm) <= 1e-9 for atm in atm_strikes):
+        return "atm_blend_candidate"
+    if option_type == "put":
+        return "otm_put" if strike < forward else "itm_put"
+    if option_type == "call":
+        return "otm_call" if strike > forward else "itm_call"
+    return "unknown"
+
+
+def _blend_atm_rows(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    valid = [row for row in rows if _is_finite(row.get("iv_bid")) and _is_finite(row.get("iv_ask"))]
+    if not valid:
+        return None
+    widths = np.asarray([max(_to_float(row.get("corridor_width"), 1e-6), 1e-6) for row in valid], dtype=np.float64)
+    weights = 1.0 / widths
+    weights = weights / max(float(np.sum(weights)), 1e-12)
+    bid = float(np.sum(weights * np.asarray([_to_float(row.get("iv_bid")) for row in valid], dtype=np.float64)))
+    ask = float(np.sum(weights * np.asarray([_to_float(row.get("iv_ask")) for row in valid], dtype=np.float64)))
+    ref_values = np.asarray([_to_float(row.get("iv_ref")) for row in valid], dtype=np.float64)
+    ref = float(np.sum(weights * np.where(np.isfinite(ref_values), ref_values, 0.5 * (bid + ask))))
+    base = dict(valid[0])
+    base["iv_bid"] = min(bid, ask)
+    base["iv_ask"] = max(bid, ask)
+    base["iv_ref"] = float(np.clip(ref, base["iv_bid"], base["iv_ask"]))
+    base["corridor_width"] = max(base["iv_ask"] - base["iv_bid"], 1e-6)
+    base["corridor_tightness"] = 1.0 / base["corridor_width"]
+    base["is_atm_blend"] = True
+    base["blend_source"] = "+".join(sorted({str(row.get("option_type", "")) for row in valid}))
+    base["fit_region"] = "atm_blend"
+    base["eligible_for_fit"] = True
+    base["excluded_from_fit_reason"] = ""
+    base["surface_source"] = "surface"
+    base["option_type"] = "surface"
+    base["contract_symbol"] = f"{base.get('symbol', '')}:{base.get('expiration', '')}:{base.get('strike', '')}:surface"
+    return base
+
+
+def _build_calibration_input(points: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     if points.is_empty():
-        return pl.DataFrame()
-    required = {"expiration", "strike", "underlying_price", "iv_ref", "weight_atm"}
+        return points, pl.DataFrame()
+    required = {"expiration", "strike", "underlying_price", "iv_ref", "iv_bid", "iv_ask", "weight_atm"}
     if not required.issubset(points.columns):
-        return pl.DataFrame()
-    eligible = points.filter(pl.col("eligible") == True)
-    if eligible.is_empty():
-        return pl.DataFrame()
+        return points, pl.DataFrame()
+    rows = points.to_dicts()
+    fit_rows: list[dict[str, Any]] = []
+    by_expiry: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_expiry.setdefault(row.get("expiration"), []).append(row)
+
+    for expiry_rows in by_expiry.values():
+        candidates = [
+            row
+            for row in expiry_rows
+            if bool(row.get("eligible"))
+            and not bool(row.get("duplicate_conflict"))
+            and not bool(row.get("exact_duplicate"))
+            and _is_finite(row.get("iv_bid"))
+            and _is_finite(row.get("iv_ask"))
+        ]
+        if not candidates:
+            continue
+        option_types_present = {str(row.get("option_type", "")).lower() for row in candidates}
+        forward = _forward_price(candidates[0])
+        strike_values = sorted({_to_float(row.get("strike")) for row in candidates if _is_finite(row.get("strike"))})
+        if not strike_values:
+            continue
+        lower = max((strike for strike in strike_values if strike <= forward), default=strike_values[0])
+        upper = min((strike for strike in strike_values if strike >= forward), default=strike_values[-1])
+        atm_strikes = {lower, upper} if abs(upper - lower) > 1e-9 else {lower}
+
+        for row in expiry_rows:
+            row["fit_region"] = _fit_region(row, forward, atm_strikes)
+            row["eligible_for_fit"] = False
+            if not row.get("drop_reason") and row["fit_region"].startswith("itm_"):
+                row["excluded_from_fit_reason"] = "itm_diagnostic_only"
+            elif row.get("drop_reason"):
+                row["excluded_from_fit_reason"] = str(row.get("drop_reason"))
+
+        if option_types_present >= {"call", "put"}:
+            for atm_strike in sorted(atm_strikes):
+                atm_rows = [row for row in candidates if abs(_to_float(row.get("strike")) - atm_strike) <= 1e-9]
+                blended = _blend_atm_rows(atm_rows)
+                if blended is not None:
+                    fit_rows.append(blended)
+                    for row in atm_rows:
+                        row["eligible_for_fit"] = True
+                        row["is_atm_blend"] = True
+                        row["blend_source"] = blended["blend_source"]
+                        row["fit_region"] = "atm_blend"
+
+            for strike in strike_values:
+                if any(abs(strike - atm) <= 1e-9 for atm in atm_strikes):
+                    continue
+                if strike < forward:
+                    side_rows = [row for row in candidates if abs(_to_float(row.get("strike")) - strike) <= 1e-9 and str(row.get("option_type", "")).lower() == "put"]
+                    fit_region = "otm_put"
+                else:
+                    side_rows = [row for row in candidates if abs(_to_float(row.get("strike")) - strike) <= 1e-9 and str(row.get("option_type", "")).lower() == "call"]
+                    fit_region = "otm_call"
+                if not side_rows:
+                    continue
+                chosen = min(side_rows, key=lambda row: _to_float(row.get("corridor_width"), float("inf")))
+                chosen["eligible_for_fit"] = True
+                chosen["fit_region"] = fit_region
+                chosen["excluded_from_fit_reason"] = ""
+                chosen["surface_source"] = "surface"
+                fit_rows.append(dict(chosen))
+        else:
+            surface_source = next(iter(option_types_present), "surface")
+            for row in candidates:
+                row["eligible_for_fit"] = True
+                row["excluded_from_fit_reason"] = ""
+                row["surface_source"] = surface_source
+                fit_rows.append(dict(row))
+
+    if not fit_rows:
+        return pl.DataFrame(rows), pl.DataFrame()
 
     aggs: list[pl.Expr] = [
-        (pl.first("asof_ts") if "asof_ts" in eligible.columns else pl.lit(None)).alias("asof_ts"),
+        (pl.first("asof_ts") if "asof_ts" in points.columns else pl.lit(None)).alias("asof_ts"),
         (
             pl.first("trading_date")
-            if "trading_date" in eligible.columns
+            if "trading_date" in points.columns
             else pl.lit(None, dtype=pl.String)
         ).alias("trading_date"),
         (
             pl.first("snapshot_kind")
-            if "snapshot_kind" in eligible.columns
+            if "snapshot_kind" in points.columns
             else pl.lit(None, dtype=pl.String)
         ).alias("snapshot_kind"),
         (
             pl.first("source_mode")
-            if "source_mode" in eligible.columns
+            if "source_mode" in points.columns
             else pl.lit(None, dtype=pl.String)
         ).alias("source_mode"),
         pl.mean("underlying_price").alias("underlying_price"),
         pl.mean("tau_years").alias("tau_years"),
         pl.mean("rate_used").alias("rate_used"),
         pl.mean("iv_ref").alias("implied_vol_input"),
+        pl.mean("iv_bid").alias("iv_bid"),
+        pl.mean("iv_ask").alias("iv_ask"),
         pl.mean("weight_uniform").alias("weight_uniform"),
         pl.mean("weight_atm").alias("weight_atm"),
         pl.mean("weight_corridor_tightness").alias("weight_corridor_tightness"),
         pl.mean("weight_atm_corridor_tightness").alias("weight_atm_corridor_tightness"),
+        pl.first("fit_region").alias("fit_region"),
+        pl.any("is_atm_blend").alias("is_atm_blend"),
+        pl.first("blend_source").alias("blend_source"),
+        pl.first("surface_source").alias("surface_source"),
         pl.len().alias("contracts"),
     ]
-    grouped = eligible.group_by(["symbol", "expiration", "option_type", "strike"]).agg(*aggs).sort(["expiration", "strike"])
-    return grouped
+    fit_frame = pl.DataFrame(fit_rows)
+    grouped = fit_frame.group_by(["symbol", "expiration", "strike"]).agg(*aggs).sort(["expiration", "strike"])
+    grouped = grouped.with_columns(
+        pl.lit("surface").alias("option_type"),
+        pl.lit(True).alias("eligible_for_fit"),
+    )
+    return pl.DataFrame(rows), grouped
 
 
 def build_quote_quality(
@@ -479,8 +630,7 @@ def build_quote_quality(
     ]
     rows = _apply_duplicate_policy(rows)
     rows = _apply_strip_reference(rows)
-    points = pl.DataFrame(rows)
-    calibration_input = _build_calibration_input(points)
+    points, calibration_input = _build_calibration_input(pl.DataFrame(rows))
 
     eligible_cols = KEY_COLUMNS + ["iv_ref", "weight_uniform", "weight_atm", "weight_corridor_tightness", "weight_atm_corridor_tightness"]
     eligible_frame = points.filter(pl.col("eligible") == True).select(

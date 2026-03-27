@@ -12,6 +12,7 @@ import polars as pl
 DATASET_NAMES = [
     "raw",
     "greeks",
+    "model_greeks",
     "ssvi",
     "dispatch",
     "parity",
@@ -31,6 +32,7 @@ DATASET_NAMES = [
 DEFAULT_BUDGET_MB = {
     "raw": 128,
     "greeks": 256,
+    "model_greeks": 256,
     "ssvi": 32,
     "dispatch": 16,
     "parity": 64,
@@ -50,6 +52,7 @@ DEFAULT_BUDGET_MB = {
 DEFAULT_ROW_CAPS = {
     "raw": 10_000,
     "greeks": 10_000,
+    "model_greeks": 10_000,
     "ssvi": 2_000,
     "dispatch": 5_000,
     "parity": 5_000,
@@ -65,7 +68,7 @@ DEFAULT_ROW_CAPS = {
     "runtime_metrics": 2_000,
 }
 
-TRIM_ORDER = ["parity_detail", "diagnostics", "ssvi", "quote_quality_points", "greeks", "raw"]
+TRIM_ORDER = ["parity_detail", "diagnostics", "ssvi", "quote_quality_points", "model_greeks", "greeks", "raw"]
 
 
 @dataclass(frozen=True, slots=True)

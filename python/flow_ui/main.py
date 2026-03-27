@@ -42,6 +42,8 @@ from flow_ui.page_payload_cache import PagePayloadCache
 from flow_ui.symbol_controls import SymbolExpirationControls, configure_expiration_combo
 from flow_ui.update_coordinator import UpdateCoordinator
 from flow_ui.viewmodels import (
+    build_overlay_frame_payload,
+    build_processing_trace_payload,
     build_short_expiry_scanner_payload,
     build_calendar_payload,
     build_density_payload,
@@ -58,6 +60,9 @@ class UIState:
     symbol: str = "SPY"
     health: str = "idle"
     last_version: int = 0
+    selected_batch_id: str = ""
+    selected_asof_ts: str = ""
+    view_scope: str = "selected_batch"
 
 
 @dataclass(slots=True)
@@ -148,6 +153,7 @@ class MainWindow(QMainWindow):
         ui_auto_degrade: bool = True,
         refresh_callback: Callable[[], str] | None = None,
         history_callback: Callable[[str, str], pl.DataFrame] | None = None,
+        history_error_callback: Callable[[str], str | None] | None = None,
         snapshot_timezone: str = "America/New_York",
         market_close_freeze_time: str = "17:00",
         final_prices_refresh_time: str = "17:30",
@@ -158,6 +164,9 @@ class MainWindow(QMainWindow):
         bootstrap_message: str | None = None,
         symbol_search_callback: Callable[[str], list[dict[str, str]]] | None = None,
         expiration_lookup_callback: Callable[[str], list[str]] | None = None,
+        batch_list_callback: Callable[[str], pl.DataFrame] | None = None,
+        batch_select_callback: Callable[[str, str], Any] | None = None,
+        pull_snapshot_callback: Callable[[str], Any] | None = None,
         live_expiration: str | None = None,
         live_expiration_setter: Callable[[str | None], None] | None = None,
         live_expiration_enabled: bool = False,
@@ -169,8 +178,15 @@ class MainWindow(QMainWindow):
         self._bridge = bridge or UIStateBridge(max_pending_per_symbol=1)
         self._coordinator = UpdateCoordinator()
         self._page_payload_cache = PagePayloadCache(max_entries=96)
+        self._plot_range_state: dict[int, dict[str, bool]] = {}
         self._refresh_callback = refresh_callback
         self._history_callback = history_callback
+        if history_error_callback is not None:
+            self._history_error_callback = history_error_callback
+        else:
+            history_source = getattr(history_callback, "__self__", None)
+            inferred = getattr(history_source, "get_dataset_read_error", None)
+            self._history_error_callback = inferred if callable(inferred) else None
         self._dirty_symbols: set[str] = set()
         self._line_items: dict[str, pg.PlotDataItem] = {}
         self._apply_latency_ms: deque[float] = deque(maxlen=240)
@@ -188,6 +204,9 @@ class MainWindow(QMainWindow):
         self._bootstrap_message = (bootstrap_message or "").strip()
         self._symbol_search_callback = symbol_search_callback
         self._expiration_lookup_callback = expiration_lookup_callback
+        self._batch_list_callback = batch_list_callback
+        self._batch_select_callback = batch_select_callback
+        self._pull_snapshot_callback = pull_snapshot_callback
         self._live_expiration_setter = live_expiration_setter
         self._live_expiration_enabled = bool(live_expiration_enabled)
         self._live_runtime_status_callback = live_runtime_status_callback
@@ -218,6 +237,25 @@ class MainWindow(QMainWindow):
             "Live expiry: choose one expiry or leave Auto to follow the configured live scope."
         )
         self._live_runtime_status = QLabel("Live runtime: waiting for the first status update")
+        self._option_chain_status = QLabel("Option Chain: waiting for snapshot data")
+        self._option_chain_status.setWordWrap(True)
+        self._review_batch_status = QLabel("Review batch: waiting for catalog")
+        self._review_batch = QComboBox()
+        self._review_batch.currentIndexChanged.connect(self._on_review_batch_selected)
+        self._pull_snapshot_button = QPushButton("Pull Full Snapshot")
+        self._pull_snapshot_button.clicked.connect(self._pull_full_snapshot)
+        self._greeks_source = QComboBox()
+        self._greeks_source.addItem("model", userData="model_greeks")
+        self._greeks_source.addItem("legacy", userData="greeks")
+        self._greeks_source.currentIndexChanged.connect(self._on_greeks_source_changed)
+        self._option_chain_expiry = QComboBox()
+        self._option_chain_expiry.currentIndexChanged.connect(self._refresh_raw_chain_view)
+        self._option_chain_option = QComboBox()
+        self._option_chain_option.addItems(["all", "call", "put"])
+        self._option_chain_option.currentIndexChanged.connect(self._refresh_raw_chain_view)
+        self._option_chain_model = PolarsTableModel()
+        option_chain_table = QTableView()
+        option_chain_table.setModel(self._option_chain_model)
         self._refresh_button = QPushButton("Refresh Latest Snapshot")
         self._refresh_button.setText(self._refresh_button_text())
         self._refresh_button.clicked.connect(self._refresh_latest_snapshot)
@@ -226,13 +264,28 @@ class MainWindow(QMainWindow):
         live_controls = QHBoxLayout()
         live_controls.addWidget(QLabel("Live Expiry"))
         live_controls.addWidget(self._live_expiration)
+        live_controls.addWidget(QLabel("Review Batch"))
+        live_controls.addWidget(self._review_batch)
+        live_controls.addWidget(self._pull_snapshot_button)
+        live_controls.addWidget(QLabel("Greeks Source"))
+        live_controls.addWidget(self._greeks_source)
         live_controls.addStretch(1)
+        chain_controls = QHBoxLayout()
+        chain_controls.addWidget(QLabel("Snapshot Expiry"))
+        chain_controls.addWidget(self._option_chain_expiry)
+        chain_controls.addWidget(QLabel("Option Type"))
+        chain_controls.addWidget(self._option_chain_option)
+        chain_controls.addStretch(1)
         live_layout.addLayout(live_controls)
         live_layout.addWidget(self._live_expiration_status)
         live_layout.addWidget(self._live_runtime_status)
+        live_layout.addWidget(self._review_batch_status)
         live_layout.addWidget(self._live_label)
         live_layout.addWidget(self._snapshot_status)
         live_layout.addWidget(self._refresh_button)
+        live_layout.addLayout(chain_controls)
+        live_layout.addWidget(self._option_chain_status)
+        live_layout.addWidget(option_chain_table)
         self._configure_live_expiration_controls(symbol, live_expiration)
 
         self._scanner_status = QLabel("SPY Short Expiry Scanner: waiting for focused expiry diagnostics")
@@ -354,8 +407,8 @@ class MainWindow(QMainWindow):
         arb_layout = QVBoxLayout(arb_page)
         arb_layout.addWidget(arb_table)
 
-        self._greeks_label = QLabel("Routed Greeks: no rows yet")
-        self._greeks_detail = QLabel("Select a routed Greeks row to inspect inputs and provenance.")
+        self._greeks_label = QLabel("Greeks: no rows yet")
+        self._greeks_detail = QLabel("Select a Greeks row to inspect inputs and provenance.")
         self._greeks_model = PolarsTableModel()
         greeks_table = QTableView()
         greeks_table.setModel(self._greeks_model)
@@ -366,7 +419,7 @@ class MainWindow(QMainWindow):
         greeks_layout.addWidget(greeks_table)
         greeks_layout.addWidget(self._greeks_detail)
 
-        self._overlay_status = QLabel("Overlay: waiting for routed Greeks")
+        self._overlay_status = QLabel("Overlay: waiting for Greeks")
         self._overlay_greek = QComboBox()
         self._overlay_greek.addItems(["delta", "gamma", "theta", "vega", "rho", "price"])
         self._overlay_opt_type = QComboBox()
@@ -412,7 +465,7 @@ class MainWindow(QMainWindow):
         overlay_layout.addLayout(overlay_controls)
         overlay_layout.addWidget(self._overlay_status)
         self._overlay_explain = QLabel(
-            "Overlay source: routed_greeks. Line plot shows the selected Greek against strike/log-moneyness; heatmap shows the same measure across strike and days-to-expiry."
+            "Overlay source: selected Greeks dataset. Line plot shows the selected Greek against strike/log-moneyness; heatmap shows the same measure across strike and days-to-expiry."
         )
         self._overlay_explain.setWordWrap(True)
         overlay_layout.addWidget(self._overlay_explain)
@@ -424,6 +477,7 @@ class MainWindow(QMainWindow):
         self._overlay_line_plot.setLabel("bottom", "Strike")
         self._overlay_line_plot.setLabel("left", "Greek")
         overlay_layout.addWidget(self._overlay_line_plot)
+        overlay_layout.addWidget(self._make_plot_range_controls(self._overlay_line_plot))
         self._overlay_line_visibility = self._make_line_visibility_control("Visible Overlay Lines")
         overlay_layout.addWidget(self._overlay_line_visibility.widget)
 
@@ -462,9 +516,9 @@ class MainWindow(QMainWindow):
         diag_layout.addWidget(parity_table)
         diag_layout.addWidget(parity_detail_table)
 
-        self._temporal_status = QLabel("Temporal Greeks: waiting for routed Greeks history")
+        self._temporal_status = QLabel("Temporal Greeks: waiting for Greeks history")
         self._temporal_explain = QLabel(
-            "Temporal source: routed_greeks history from cache plus persisted parquet history. X=strike, Y=selected Greek, slider=batch timestamp for one expiry."
+            "Temporal source: selected Greeks dataset from cache plus persisted parquet history. X=strike, Y=selected Greek, slider=batch timestamp for one expiry."
         )
         self._temporal_explain.setWordWrap(True)
         self._temporal_expiry = QComboBox()
@@ -472,6 +526,9 @@ class MainWindow(QMainWindow):
         self._temporal_greek = QComboBox()
         self._temporal_greek.addItems(["delta", "gamma", "theta", "vega", "rho", "model_price"])
         self._temporal_greek.currentIndexChanged.connect(self._refresh_temporal_plot)
+        self._temporal_scope = QComboBox()
+        self._temporal_scope.addItems(["selected_batch", "history"])
+        self._temporal_scope.currentIndexChanged.connect(self._refresh_temporal_plot)
         self._temporal_time_label = QLabel("Time: n/a")
         self._temporal_slider = QSlider(Qt.Horizontal)
         self._temporal_slider.setMinimum(0)
@@ -487,6 +544,8 @@ class MainWindow(QMainWindow):
         temporal_controls.addWidget(self._temporal_expiry)
         temporal_controls.addWidget(QLabel("Greek"))
         temporal_controls.addWidget(self._temporal_greek)
+        temporal_controls.addWidget(QLabel("Scope"))
+        temporal_controls.addWidget(self._temporal_scope)
         temporal_page = QWidget()
         temporal_layout = QVBoxLayout(temporal_page)
         temporal_layout.addLayout(temporal_controls)
@@ -496,9 +555,9 @@ class MainWindow(QMainWindow):
         temporal_layout.addWidget(self._temporal_slider)
         temporal_layout.addWidget(self._temporal_plot)
 
-        self._price_error_status = QLabel("Model vs Market: waiting for routed Greeks")
+        self._price_error_status = QLabel("Model vs Market: waiting for model diagnostics")
         self._price_error_explain = QLabel(
-            "Source: routed_greeks. Upper plot is model_price and market_mid against strike for one expiry. Lower plot is model-minus-market price error against strike."
+            "Source: surface diagnostics. Upper plot is model price against quoted bid/ask by strike for one expiry. Lower plot is corridor error against strike."
         )
         self._price_error_explain.setWordWrap(True)
         self._price_error_expiry = QComboBox()
@@ -537,8 +596,10 @@ class MainWindow(QMainWindow):
         price_layout.addWidget(self._price_error_status)
         price_layout.addWidget(self._price_error_explain)
         price_layout.addWidget(self._price_error_plot)
+        price_layout.addWidget(self._make_plot_range_controls(self._price_error_plot))
         price_layout.addWidget(self._price_error_line_visibility.widget)
         price_layout.addWidget(self._price_error_delta_plot)
+        price_layout.addWidget(self._make_plot_range_controls(self._price_error_delta_plot))
         price_layout.addWidget(self._price_error_delta_visibility.widget)
 
         self._validation_status = QLabel("Validation Workspace: waiting for surface diagnostics")
@@ -607,6 +668,7 @@ class MainWindow(QMainWindow):
         validation_layout.addWidget(self._validation_status)
         validation_layout.addWidget(self._validation_explain)
         validation_layout.addWidget(self._validation_line_plot)
+        validation_layout.addWidget(self._make_plot_range_controls(self._validation_line_plot))
         validation_layout.addWidget(self._validation_line_visibility.widget)
         validation_layout.addWidget(self._validation_heat_plot)
         validation_layout.addWidget(surface_summary_table)
@@ -652,8 +714,55 @@ class MainWindow(QMainWindow):
         calendar_layout.addWidget(self._calendar_explain)
         calendar_layout.addWidget(self._calendar_heat_plot)
         calendar_layout.addWidget(self._density_plot)
+        calendar_layout.addWidget(self._make_plot_range_controls(self._density_plot))
         calendar_layout.addWidget(self._density_visibility.widget)
         calendar_layout.addWidget(calendar_violation_table)
+
+        self._trace_status = QLabel("Processing Trace: waiting for surface diagnostics")
+        self._trace_explain = QLabel(
+            "Batch-scoped processing trace from cleaned American quotes through de-Americanization, SSVI validation, and American repricing."
+        )
+        self._trace_explain.setWordWrap(True)
+        self._trace_expiry = QComboBox()
+        self._trace_expiry.currentIndexChanged.connect(self._refresh_processing_trace_view)
+        self._trace_option = QComboBox()
+        self._trace_option.addItems(["all", "call", "put"])
+        self._trace_option.currentIndexChanged.connect(self._refresh_processing_trace_view)
+        trace_controls = QHBoxLayout()
+        trace_controls.addWidget(QLabel("Expiry"))
+        trace_controls.addWidget(self._trace_expiry)
+        trace_controls.addWidget(QLabel("Option Type"))
+        trace_controls.addWidget(self._trace_option)
+        trace_controls.addStretch(1)
+        self._trace_plots: dict[str, pg.PlotWidget] = {}
+        self._trace_items: dict[str, dict[str, pg.PlotDataItem]] = {}
+        self._trace_visibility: dict[str, LineVisibilityControl] = {}
+        trace_page = QWidget()
+        trace_layout = QVBoxLayout(trace_page)
+        trace_layout.addLayout(trace_controls)
+        trace_layout.addWidget(self._trace_status)
+        trace_layout.addWidget(self._trace_explain)
+        for panel_key, panel_title in (
+            ("cleaning", "Cleaning"),
+            ("deamericanization", "De-Americanization"),
+            ("vol_fit", "Vol Fit Corridor"),
+            ("vol_diag", "Full Vol Diagnostic"),
+            ("euro_reprice", "European Reprice"),
+            ("american_reprice", "American Reprice"),
+        ):
+            trace_layout.addWidget(QLabel(panel_title))
+            plot = pg.PlotWidget()
+            plot.setBackground("w")
+            plot.setLabel("bottom", "Strike")
+            plot.setLabel("left", panel_title)
+            plot.addLegend(offset=(10, 10))
+            trace_layout.addWidget(plot)
+            trace_layout.addWidget(self._make_plot_range_controls(plot))
+            control = self._make_line_visibility_control(f"Visible {panel_title} Lines")
+            trace_layout.addWidget(control.widget)
+            self._trace_plots[panel_key] = plot
+            self._trace_items[panel_key] = {}
+            self._trace_visibility[panel_key] = control
 
         self._runtime_metrics_status = QLabel("Runtime Metrics: waiting for latency samples")
         self._runtime_metrics_explain = QLabel(
@@ -675,18 +784,20 @@ class MainWindow(QMainWindow):
         runtime_layout.addWidget(self._runtime_metrics_status)
         runtime_layout.addWidget(self._runtime_metrics_explain)
         runtime_layout.addWidget(self._runtime_metrics_plot)
+        runtime_layout.addWidget(self._make_plot_range_controls(self._runtime_metrics_plot))
         runtime_layout.addWidget(self._runtime_metric_visibility.widget)
         runtime_layout.addWidget(runtime_metrics_table)
 
         tabs.addTab(scanner_page, "Short Expiry Scanner")
         tabs.addTab(run_page, "Run Config")
-        tabs.addTab(live_page, "Live Chain")
+        tabs.addTab(live_page, "Option Chain")
         tabs.addTab(iv_page, "SSVI vs Baseline")
-        tabs.addTab(greeks_page, "Routed Greeks")
+        tabs.addTab(greeks_page, "Greeks")
         tabs.addTab(overlay_page, "Greeks Overlay")
         tabs.addTab(price_page, "Model vs Market")
         tabs.addTab(validation_page, "Validation Workspace")
         tabs.addTab(calendar_page, "Calendar / Density")
+        tabs.addTab(trace_page, "Processing Trace")
         tabs.addTab(runtime_page, "Runtime Metrics")
         tabs.addTab(temporal_page, "Temporal Greeks")
         tabs.addTab(arb_page, "Arbitrage Scanner")
@@ -695,6 +806,8 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._apply_pending_updates)
         self._timer.start(max(refresh_ms, 10))
+        self._pull_snapshot_button.setEnabled(self._pull_snapshot_callback is not None)
+        self._refresh_review_batch_controls()
         existing = self._cache.get_snapshot_nowait(symbol)
         if existing is not None:
             self._dirty_symbols.add(symbol)
@@ -742,32 +855,56 @@ class MainWindow(QMainWindow):
 
     def _apply_snapshot(self, snapshot: SymbolSnapshot) -> None:
         frame = snapshot.raw
+        self._state.selected_batch_id = snapshot.batch_id
         self._page_payload_cache.bind_batch(snapshot.batch_id)
+        self._refresh_review_batch_controls()
         if frame.is_empty():
             self._page_payload_cache.clear()
-            self._live_label.setText("Live monitor: no rows in cache")
-            self._snapshot_status.setText("Snapshot status: no cached snapshot")
-            self._iv_label.setText("IV/term structure: no rows in cache")
+            self._live_label.setText(self._with_dataset_error("Live monitor: no rows in cache", "raw"))
+            self._snapshot_status.setText(self._with_dataset_error("Snapshot status: no cached snapshot", "raw"))
+            self._iv_label.setText(self._with_dataset_error("IV/term structure: no rows in cache", "ssvi"))
             self._ssvi_model.update([["No SSVI diagnostics"]], ["status"])
-            self._greeks_label.setText("Routed Greeks: no rows in cache")
-            self._greeks_model.update([["No routed Greeks"]], ["status"], ROUTED_GREEKS_COLUMN_HELP)
-            self._greeks_detail.setText("Select a routed Greeks row to inspect inputs and provenance.")
-            self._overlay_status.setText("Overlay: no routed Greeks in cache")
+            self._greeks_label.setText(self._with_dataset_error("Model Greeks: no rows in cache", self._current_greeks_dataset()))
+            self._greeks_model.update([["No model Greeks"]], ["status"], ROUTED_GREEKS_COLUMN_HELP)
+            self._greeks_detail.setText("Select a model Greeks row to inspect inputs and provenance.")
+            self._overlay_status.setText(self._with_dataset_error("Overlay: no Greeks in cache", self._current_greeks_dataset()))
             self._arb_model.update([], ["status"])
             self._dispatch_model.update([["No routing summary"]], ["status"])
             self._parity_model.update([["No parity diagnostics"]], ["status"])
             self._parity_detail_model.update([["No parity detail diagnostics"]], ["status"])
             self._routing_label.setText("Routing: no diagnostics yet")
-            self._temporal_status.setText("Temporal Greeks: no routed Greeks history")
-            self._price_error_status.setText("Model vs Market: no routed Greeks in cache")
-            self._validation_status.setText("Validation Workspace: no surface diagnostics in cache")
-            self._calendar_status.setText("Calendar / Density: no surface diagnostics in cache")
-            self._runtime_metrics_status.setText("Runtime Metrics: no metrics in cache")
-            self._scanner_status.setText("SPY Short Expiry Scanner: no focused expiry diagnostics in cache")
+            self._temporal_status.setText(self._with_dataset_error("Temporal Greeks: no Greeks history", self._current_greeks_dataset()))
+            self._price_error_status.setText(
+                self._with_dataset_error("Model vs Market: no model Greeks in cache", "surface_points", self._current_greeks_dataset())
+            )
+            self._validation_status.setText(
+                self._with_dataset_error("Validation Workspace: no surface diagnostics in cache", "surface_points", "surface_diagnostics")
+            )
+            self._calendar_status.setText(
+                self._with_dataset_error("Calendar / Density: no surface diagnostics in cache", "surface_points")
+            )
+            self._trace_status.setText(
+                self._with_dataset_error("Processing Trace: no surface diagnostics in cache", "surface_points")
+            )
+            self._runtime_metrics_status.setText(
+                self._with_dataset_error("Runtime Metrics: no metrics in cache", "runtime_metrics")
+            )
+            self._scanner_status.setText(
+                self._with_dataset_error(
+                    "SPY Short Expiry Scanner: no focused expiry diagnostics in cache",
+                    "focus_expiry_summary",
+                    "dealer_exposure_points",
+                    "scanner_levels",
+                    "flow_proxy_points",
+                )
+            )
             self._scanner_runtime_badge.setText("Scanner runtime: waiting for first batch")
             self._scanner_summary_model.update([["No scanner summary"]], ["status"])
             self._scanner_levels_model.update([["No scanner levels"]], ["status"])
             self._scanner_flow_model.update([["No proxy flow diagnostics"]], ["status"])
+            self._refresh_raw_chain_controls(pl.DataFrame())
+            self._option_chain_status.setText(self._with_dataset_error("Option Chain: no raw snapshot in cache", "raw"))
+            self._option_chain_model.update([["No raw option-chain snapshot"]], ["status"])
             self._sync_scanner_focus_cards(pl.DataFrame(), self._scanner_selected_focus_label)
             self._scanner_heat_img.setImage(np.ascontiguousarray(np.zeros((1, 1), dtype=np.float32)), autoLevels=False)
             self._scanner_heat_img.setRect(QRectF(0.0, 0.0, 1.0, 1.0))
@@ -784,6 +921,8 @@ class MainWindow(QMainWindow):
         self._snapshot_status.setText(
             f"Snapshot status: kind={snapshot.snapshot_kind} final={snapshot.is_final_for_day} trading_date={snapshot.trading_date}{suffix}"
         )
+        self._refresh_raw_chain_controls(frame)
+        self._refresh_raw_chain_view()
 
         ssvi = snapshot.ssvi
         if not ssvi.is_empty():
@@ -812,51 +951,11 @@ class MainWindow(QMainWindow):
             )
             self._ssvi_model.update(show.rows(), show.columns)
         else:
+            self._iv_label.setText(self._with_dataset_error("IV/term structure: no SSVI diagnostics in cache", "ssvi"))
             self._ssvi_model.update([["No SSVI diagnostics"]], ["status"])
-
-        greeks = snapshot.greeks
-        if greeks.is_empty():
-            self._greeks_label.setText("Routed Greeks: no rows")
-            self._greeks_model.update([["No routed Greeks"]], ["status"], ROUTED_GREEKS_COLUMN_HELP)
-            self._greeks_detail.setText("Select a routed Greeks row to inspect inputs and provenance.")
-            self._overlay_status.setText("Overlay: no routed Greeks")
-        else:
-            ok = int(greeks["success"].sum()) if "success" in greeks.columns else 0
-            total = greeks.height
-            self._greeks_label.setText(f"Routed Greeks: success={ok}/{total}")
-            show_cols = [
-                "expiration",
-                "option_type",
-                "strike",
-                "greeks_engine",
-                "engine_used",
-                "market_mid",
-                "model_price",
-                "display_price_source",
-                "rate_used",
-                "dividend_used",
-                "tau_years",
-                "price",
-                "delta",
-                "gamma",
-                "theta",
-                "vega",
-                "rho",
-                "success",
-            ]
-            use_cols = [c for c in show_cols if c in greeks.columns]
-            self._greeks_model.update(greeks.select(use_cols).head(120).rows(), use_cols, ROUTED_GREEKS_COLUMN_HELP)
-            self._refresh_expiry_options(greeks)
-            self._refresh_temporal_controls()
-            self._coordinator.request_overlay(
-                snapshot,
-                greek=self._overlay_greek.currentText(),
-                option_type=self._overlay_opt_type.currentText(),
-                expiry_filter=self._overlay_expiry.currentText(),
-                space_mode=self._overlay_space.currentText(),
-                engine_mask=self._selected_engine_mask(),
-                dual_mode=bool(self._overlay_dual_mode.isChecked()),
-            )
+        self._refresh_greeks_table()
+        self._refresh_temporal_controls()
+        self._request_overlay_refresh()
 
         if all(c in frame.columns for c in ("bid", "ask", "strike", "option_type")):
             violations = scan_arbitrage_violations(frame)
@@ -912,6 +1011,8 @@ class MainWindow(QMainWindow):
         self._refresh_validation_view()
         self._refresh_calendar_controls()
         self._refresh_calendar_density_view()
+        self._refresh_processing_trace_controls()
+        self._refresh_processing_trace_view()
         self._refresh_runtime_metrics_view()
         self._refresh_scanner_view()
 
@@ -929,20 +1030,60 @@ class MainWindow(QMainWindow):
         self._overlay_expiry.setCurrentIndex(idx if idx >= 0 else 0)
         self._overlay_expiry.blockSignals(False)
 
+    def _current_greeks_frame(self) -> pl.DataFrame:
+        dataset = self._current_greeks_dataset()
+        frame = self._history_frame(dataset)
+        if frame.is_empty() and dataset == "model_greeks":
+            snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+            if snapshot is not None:
+                frame = snapshot.greeks
+        return frame
+
+    def _refresh_greeks_table(self) -> None:
+        greeks = self._current_greeks_frame()
+        label_prefix = "Model Greeks" if self._current_greeks_dataset() == "model_greeks" else "Legacy Greeks"
+        if greeks.is_empty():
+            self._greeks_label.setText(self._with_dataset_error(f"{label_prefix}: no rows", self._current_greeks_dataset()))
+            self._greeks_model.update([[f"No {label_prefix.lower()}"]], ["status"], ROUTED_GREEKS_COLUMN_HELP)
+            self._greeks_detail.setText("Select a Greeks row to inspect inputs and provenance.")
+            return
+        ok = int(greeks["success"].sum()) if "success" in greeks.columns else 0
+        total = greeks.height
+        self._greeks_label.setText(f"{label_prefix}: success={ok}/{total}")
+        show_cols = [
+            "expiration",
+            "option_type",
+            "strike",
+            "greeks_engine",
+            "engine_used",
+            "market_mid",
+            "model_price",
+            "display_price_source",
+            "rate_used",
+            "dividend_used",
+            "tau_years",
+            "price",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+            "rho",
+            "success",
+        ]
+        use_cols = [c for c in show_cols if c in greeks.columns]
+        self._greeks_model.update(greeks.select(use_cols).head(120).rows(), use_cols, ROUTED_GREEKS_COLUMN_HELP)
+        self._refresh_expiry_options(greeks)
+
     def _refresh_price_error_controls(self) -> None:
         frame = self._history_frame("surface_points")
         if frame.is_empty():
-            snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
-            frame = snapshot.greeks if snapshot is not None else pl.DataFrame()
+            frame = self._current_greeks_frame()
         if frame.is_empty() or "expiration" not in frame.columns:
+            self._price_error_status.setText(
+                self._with_dataset_error("Model vs Market: no surface or Greeks history", "surface_points", self._current_greeks_dataset())
+            )
             return
-        latest = frame
-        if "asof_ts" in latest.columns:
-            latest_ts = latest["asof_ts"].max()
-            latest = latest.filter(pl.col("asof_ts") == latest_ts)
-        if "batch_id" in latest.columns and not latest.is_empty():
-            latest_batch = str(latest["batch_id"][-1])
-            latest = latest.filter(pl.col("batch_id").cast(pl.String) == latest_batch)
+        latest = self._latest_frame(frame)
         expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
         current = self._price_error_expiry.currentText() if self._price_error_expiry.count() > 0 else ""
         self._price_error_expiry.blockSignals(True)
@@ -953,12 +1094,85 @@ class MainWindow(QMainWindow):
         self._price_error_expiry.setCurrentIndex(idx if idx >= 0 else 0)
         self._price_error_expiry.blockSignals(False)
 
+    def _refresh_raw_chain_controls(self, frame: pl.DataFrame) -> None:
+        latest = self._latest_frame(frame)
+        current = self._option_chain_expiry.currentText() if self._option_chain_expiry.count() > 0 else "all"
+        self._option_chain_expiry.blockSignals(True)
+        self._option_chain_expiry.clear()
+        self._option_chain_expiry.addItem("all")
+        if not latest.is_empty() and "expiration" in latest.columns:
+            expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
+            for exp in expiries:
+                self._option_chain_expiry.addItem(exp)
+        idx = self._option_chain_expiry.findText(current)
+        self._option_chain_expiry.setCurrentIndex(idx if idx >= 0 else 0)
+        self._option_chain_expiry.blockSignals(False)
+
+    def _refresh_raw_chain_view(self) -> None:
+        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+        frame = snapshot.raw if snapshot is not None else pl.DataFrame()
+        if frame.is_empty():
+            self._option_chain_status.setText(self._with_dataset_error("Option Chain: no raw snapshot in cache", "raw"))
+            self._option_chain_model.update([["No raw option-chain snapshot"]], ["status"])
+            return
+        latest = self._latest_frame(frame)
+        expiry = self._option_chain_expiry.currentText() or "all"
+        option_type = self._option_chain_option.currentText()
+        filt = latest
+        if expiry != "all" and "expiration" in filt.columns:
+            filt = filt.filter(pl.col("expiration").cast(pl.String) == expiry)
+        if option_type != "all" and "option_type" in filt.columns:
+            filt = filt.filter(pl.col("option_type") == option_type)
+        if filt.is_empty():
+            self._option_chain_status.setText(
+                self._with_dataset_error(
+                    f"Option Chain: no rows survived expiry={expiry} option={option_type}",
+                    "raw",
+                )
+            )
+            self._option_chain_model.update([["No rows for selected option-chain filter"]], ["status"])
+            return
+        sort_cols = [c for c in ("expiration", "option_type", "strike") if c in filt.columns]
+        if sort_cols:
+            filt = filt.sort(sort_cols)
+        show_cols = [
+            c
+            for c in (
+                "expiration",
+                "option_type",
+                "contract_symbol",
+                "strike",
+                "bid",
+                "ask",
+                "last",
+                "volume",
+                "open_interest",
+                "underlying_price",
+                "implied_vol_vendor",
+                "provider",
+                "batch_id",
+                "asof_ts",
+            )
+            if c in filt.columns
+        ]
+        display = filt.select(show_cols).head(300)
+        self._option_chain_model.update(display.rows(), show_cols)
+        batch_id = str(filt["batch_id"][0]) if "batch_id" in filt.columns and filt.height > 0 else "n/a"
+        self._option_chain_status.setText(
+            self._with_dataset_error(
+                f"Option Chain: batch={batch_id} expiry={expiry} option={option_type} rows={display.height}/{filt.height}",
+                "raw",
+            )
+        )
+
     def _refresh_validation_controls(self) -> None:
         frame = self._history_frame("surface_points")
         if frame.is_empty() or "expiration" not in frame.columns:
-            self._validation_status.setText("Validation Workspace: no surface diagnostics history")
+            self._validation_status.setText(
+                self._with_dataset_error("Validation Workspace: no surface diagnostics history", "surface_points", "surface_diagnostics")
+            )
             return
-        latest = frame.sort([c for c in ("asof_ts", "batch_id", "expiration") if c in frame.columns]).tail(frame.height)
+        latest = self._latest_frame(frame)
         expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
         current = self._validation_expiry.currentText() if self._validation_expiry.count() > 0 else "all"
         self._validation_expiry.blockSignals(True)
@@ -973,9 +1187,12 @@ class MainWindow(QMainWindow):
     def _refresh_calendar_controls(self) -> None:
         frame = self._history_frame("surface_points")
         if frame.is_empty() or "expiration" not in frame.columns:
-            self._calendar_status.setText("Calendar / Density: no surface diagnostics history")
+            self._calendar_status.setText(
+                self._with_dataset_error("Calendar / Density: no surface diagnostics history", "surface_points")
+            )
             return
-        expiries = sorted({str(x) for x in frame["expiration"].to_list() if x is not None})
+        latest = self._latest_frame(frame)
+        expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
         current = self._density_expiry.currentText() if self._density_expiry.count() > 0 else ""
         self._density_expiry.blockSignals(True)
         self._density_expiry.clear()
@@ -985,25 +1202,190 @@ class MainWindow(QMainWindow):
         self._density_expiry.setCurrentIndex(idx if idx >= 0 else 0)
         self._density_expiry.blockSignals(False)
 
+    def _refresh_processing_trace_controls(self) -> None:
+        frame = self._history_frame("surface_points")
+        if frame.is_empty() or "expiration" not in frame.columns:
+            self._trace_status.setText(
+                self._with_dataset_error("Processing Trace: no surface diagnostics history", "surface_points")
+            )
+            return
+        latest = self._latest_frame(frame)
+        expiries = sorted({str(x) for x in latest["expiration"].to_list() if x is not None})
+        current = self._trace_expiry.currentText() if self._trace_expiry.count() > 0 else ""
+        self._trace_expiry.blockSignals(True)
+        self._trace_expiry.clear()
+        for exp in expiries:
+            self._trace_expiry.addItem(exp)
+        idx = self._trace_expiry.findText(current)
+        self._trace_expiry.setCurrentIndex(idx if idx >= 0 else 0)
+        self._trace_expiry.blockSignals(False)
+
+    def _current_greeks_dataset(self) -> str:
+        value = self._greeks_source.currentData()
+        return str(value or "model_greeks")
+
+    def _selected_batch_id(self) -> str:
+        if self._state.selected_batch_id:
+            return self._state.selected_batch_id
+        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+        return snapshot.batch_id if snapshot is not None else ""
+
+    def _refresh_review_batch_controls(self) -> None:
+        if self._batch_list_callback is None:
+            self._review_batch_status.setText("Review batch: catalog lookup unavailable")
+            return
+        try:
+            catalog = self._batch_list_callback(self._state.symbol)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("review_batch_catalog_failed err=%s", exc)
+            self._review_batch_status.setText(f"Review batch: failed to load catalog: {exc}")
+            return
+        current = self._selected_batch_id()
+        self._review_batch.blockSignals(True)
+        self._review_batch.clear()
+        for row in catalog.to_dicts():
+            batch_id = str(row.get("batch_id", ""))
+            asof = row.get("asof_ts") or row.get("updated_at_utc") or ""
+            kind = str(row.get("snapshot_kind", ""))
+            self._review_batch.addItem(f"{asof} | {kind} | {batch_id}", userData=batch_id)
+        if self._review_batch.count() > 0:
+            idx = next((i for i in range(self._review_batch.count()) if str(self._review_batch.itemData(i) or "") == current), 0)
+            self._review_batch.setCurrentIndex(idx)
+            self._state.selected_batch_id = str(self._review_batch.currentData() or current or "")
+            self._state.selected_asof_ts = self._review_batch.currentText().split("|", 1)[0].strip()
+        self._review_batch.blockSignals(False)
+        count = int(catalog.height) if hasattr(catalog, "height") else self._review_batch.count()
+        self._review_batch_status.setText(f"Review batch: selected={self._state.selected_batch_id or 'n/a'} available={count}")
+
+    def _on_review_batch_selected(self) -> None:
+        batch_id = str(self._review_batch.currentData() or "")
+        if not batch_id or batch_id == self._state.selected_batch_id:
+            return
+        self._state.selected_batch_id = batch_id
+        if self._batch_select_callback is not None:
+            try:
+                result = self._batch_select_callback(self._state.symbol, batch_id)
+                message = getattr(result, "message", "")
+                if message:
+                    self._snapshot_status.setText(f"Snapshot status: {message}")
+            except Exception as exc:  # pragma: no cover
+                logger.exception("review_batch_select_failed batch=%s err=%s", batch_id, exc)
+                self._review_batch_status.setText(f"Review batch: failed to hydrate batch={batch_id}: {exc}")
+                return
+        self._page_payload_cache.bind_batch(batch_id)
+        self._refresh_review_views()
+
+    def _pull_full_snapshot(self) -> None:
+        if self._pull_snapshot_callback is None:
+            self._review_batch_status.setText("Review batch: full snapshot pull is unavailable.")
+            return
+        try:
+            result = self._pull_snapshot_callback(self._state.symbol)
+            message = getattr(result, "message", "")
+            if message:
+                self._snapshot_status.setText(f"Snapshot status: {message}")
+        except Exception as exc:  # pragma: no cover
+            logger.exception("pull_full_snapshot_failed err=%s", exc)
+            self._review_batch_status.setText(f"Review batch: failed to pull full snapshot: {exc}")
+            return
+        self._refresh_review_batch_controls()
+        self._refresh_review_views()
+
+    def _on_greeks_source_changed(self) -> None:
+        self._refresh_greeks_table()
+        self._request_overlay_refresh()
+        self._refresh_temporal_controls()
+        self._refresh_price_error_controls()
+        self._refresh_price_error_plot()
+
+    def _refresh_review_views(self) -> None:
+        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+        raw = snapshot.raw if snapshot is not None else pl.DataFrame()
+        self._refresh_raw_chain_controls(raw)
+        self._refresh_raw_chain_view()
+        self._refresh_greeks_table()
+        self._refresh_temporal_controls()
+        self._request_overlay_refresh()
+        self._refresh_price_error_controls()
+        self._refresh_price_error_plot()
+        self._refresh_validation_controls()
+        self._refresh_validation_view()
+        self._refresh_calendar_controls()
+        self._refresh_calendar_density_view()
+        self._refresh_processing_trace_controls()
+        self._refresh_processing_trace_view()
+        self._refresh_runtime_metrics_view()
+        self._refresh_scanner_view()
+
     def _history_frame(self, dataset: str) -> pl.DataFrame:
         history = self._cache.get_history_nowait(self._state.symbol, dataset)
         if self._history_callback is None:
-            return history
-        persisted = self._history_callback(self._state.symbol, dataset)
-        if history.is_empty():
-            return persisted
-        if persisted.is_empty():
-            return history
-        merged = pl.concat([persisted, history], how="diagonal")
-        unique_cols = [c for c in ("batch_id", "asof_ts", "expiration", "option_type", "strike", "engine_used") if c in merged.columns]
-        if unique_cols:
-            merged = merged.unique(subset=unique_cols, keep="last")
-        sort_cols = [c for c in ("asof_ts", "expiration", "strike") if c in merged.columns]
-        if sort_cols:
-            merged = merged.sort(sort_cols)
-        return merged
+            frame = history
+        else:
+            persisted = self._history_callback(self._state.symbol, dataset)
+            if history.is_empty():
+                frame = persisted
+            elif persisted.is_empty():
+                frame = history
+            else:
+                merged = pl.concat([persisted, history], how="diagonal")
+                unique_cols = [c for c in ("batch_id", "asof_ts", "expiration", "option_type", "strike", "engine_used") if c in merged.columns]
+                if unique_cols:
+                    merged = merged.unique(subset=unique_cols, keep="last")
+                sort_cols = [c for c in ("asof_ts", "expiration", "strike") if c in merged.columns]
+                if sort_cols:
+                    merged = merged.sort(sort_cols)
+                frame = merged
+        if frame.is_empty():
+            return frame
+        if dataset != "snapshot_catalog" and not (dataset == self._current_greeks_dataset() and self._temporal_scope.currentText() == "history"):
+            batch_id = self._selected_batch_id()
+            if batch_id and "batch_id" in frame.columns:
+                scoped = frame.filter(pl.col("batch_id").cast(pl.String) == batch_id)
+                if not scoped.is_empty():
+                    return scoped
+        return frame
+
+    def _history_error(self, dataset: str) -> str | None:
+        if self._history_error_callback is None:
+            return None
+        try:
+            message = self._history_error_callback(dataset)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("history_error_callback_failed dataset=%s err=%s", dataset, exc)
+            return f"history error callback failed: {exc}"
+        text = str(message).strip() if message is not None else ""
+        return text or None
+
+    def _with_dataset_error(self, base: str, *datasets: str) -> str:
+        seen: set[str] = set()
+        errors: list[str] = []
+        for dataset in datasets:
+            if dataset in seen:
+                continue
+            seen.add(dataset)
+            message = self._history_error(dataset)
+            if message:
+                errors.append(f"{dataset}: {message}")
+        if not errors:
+            return base
+        return f"{base} | read_error={' ; '.join(errors)}"
+
+    def _latest_frame(self, frame: pl.DataFrame) -> pl.DataFrame:
+        latest = frame
+        if latest.is_empty():
+            return latest
+        if "asof_ts" in latest.columns:
+            latest_ts = latest["asof_ts"].max()
+            latest = latest.filter(pl.col("asof_ts") == latest_ts)
+        if "batch_id" in latest.columns and not latest.is_empty():
+            latest_batch = str(latest["batch_id"][-1])
+            latest = latest.filter(pl.col("batch_id").cast(pl.String) == latest_batch)
+        return latest
 
     def _payload_batch_id(self) -> str:
+        if self._state.selected_batch_id:
+            return self._state.selected_batch_id
         snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
         return snapshot.batch_id if snapshot is not None else ""
 
@@ -1049,6 +1431,95 @@ class MainWindow(QMainWindow):
             grid_host=grid_host,
             grid_layout=grid_layout,
         )
+
+    def _plot_state(self, plot: pg.PlotWidget) -> dict[str, bool]:
+        return self._plot_range_state.setdefault(id(plot), {"x": True, "y": True})
+
+    def _on_plot_range_manually_changed(self, plot: pg.PlotWidget, *args) -> None:  # noqa: ANN002
+        state = self._plot_state(plot)
+        state["x"] = False
+        state["y"] = False
+
+    def _make_plot_range_controls(self, plot: pg.PlotWidget) -> QWidget:
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("Axes"))
+        reset_x = QPushButton("Auto X")
+        reset_x.clicked.connect(lambda: self._reset_plot_axis(plot, "x"))
+        layout.addWidget(reset_x)
+        reset_y = QPushButton("Auto Y")
+        reset_y.clicked.connect(lambda: self._reset_plot_axis(plot, "y"))
+        layout.addWidget(reset_y)
+        reset_both = QPushButton("Auto Both")
+        reset_both.clicked.connect(lambda: self._reset_plot_axis(plot, "both"))
+        layout.addWidget(reset_both)
+        layout.addStretch(1)
+        try:
+            plot.getViewBox().sigRangeChangedManually.connect(
+                lambda *args, target=plot: self._on_plot_range_manually_changed(target, *args)
+            )
+        except Exception:  # pragma: no cover
+            pass
+        return panel
+
+    def _visible_bounds(self, storage: dict[str, pg.PlotDataItem], axis: int) -> tuple[float, float] | None:
+        bounds: list[tuple[float, float]] = []
+        for item in storage.values():
+            if not item.isVisible():
+                continue
+            data_bounds = item.dataBounds(axis)
+            if data_bounds is None:
+                continue
+            low, high = data_bounds
+            if low is None or high is None:
+                continue
+            if not (np.isfinite(low) and np.isfinite(high)):
+                continue
+            bounds.append((float(low), float(high)))
+        if not bounds:
+            return None
+        low = min(bound[0] for bound in bounds)
+        high = max(bound[1] for bound in bounds)
+        if not np.isfinite(low) or not np.isfinite(high):
+            return None
+        if low == high:
+            pad = max(abs(low) * 0.05, 1e-3)
+            low -= pad
+            high += pad
+        return low, high
+
+    def _apply_plot_auto_range(self, plot: pg.PlotWidget, storage: dict[str, pg.PlotDataItem]) -> None:
+        state = self._plot_state(plot)
+        view = plot.getViewBox()
+        x_bounds = self._visible_bounds(storage, 0) if state["x"] else None
+        y_bounds = self._visible_bounds(storage, 1) if state["y"] else None
+        if x_bounds is not None:
+            view.setXRange(x_bounds[0], x_bounds[1], padding=0.04)
+        if y_bounds is not None:
+            view.setYRange(y_bounds[0], y_bounds[1], padding=0.08)
+
+    def _reset_plot_axis(self, plot: pg.PlotWidget, axis: str) -> None:
+        state = self._plot_state(plot)
+        if axis in {"x", "both"}:
+            state["x"] = True
+        if axis in {"y", "both"}:
+            state["y"] = True
+        if plot is self._overlay_line_plot:
+            storage = self._line_items
+        elif plot is self._price_error_plot:
+            storage = self._price_error_line_items
+        elif plot is self._price_error_delta_plot:
+            storage = self._price_error_delta_items
+        elif plot is self._validation_line_plot:
+            storage = self._validation_line_items
+        elif plot is self._density_plot:
+            storage = self._density_items
+        elif plot is self._runtime_metrics_plot:
+            storage = self._runtime_metric_items
+        else:
+            storage = next((items for key, items in self._trace_items.items() if self._trace_plots[key] is plot), {})
+        self._apply_plot_auto_range(plot, storage)
 
     def _on_line_visibility_changed(
         self,
@@ -1121,27 +1592,52 @@ class MainWindow(QMainWindow):
         control.widget.setVisible(has_series)
 
     def _request_overlay_refresh(self) -> None:
-        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
-        if snapshot is None or snapshot.greeks.is_empty():
+        frame = self._current_greeks_frame()
+        if frame.is_empty():
+            self._apply_overlay_payload(
+                {
+                    "line_series": {},
+                    "heat_image": np.ascontiguousarray(np.zeros((1, 1), dtype=np.float32)),
+                    "rect": (0.0, 0.0, 1.0, 1.0),
+                    "levels": (0.0, 1.0),
+                    "meta": {
+                        "status": "missing_greeks",
+                        "rows": 0,
+                        "data_source": self._current_greeks_dataset(),
+                        "chart_explanation": "No Greeks data is available for the requested overlay.",
+                        "y_axis_values": [0.0],
+                        "y_axis_labels": ["n/a"],
+                        "is_single_expiry": True,
+                    },
+                },
+                version=self._state.last_version,
+            )
             return
-        self._coordinator.request_overlay(
-            snapshot,
-            greek=self._overlay_greek.currentText(),
-            option_type=self._overlay_opt_type.currentText(),
-            expiry_filter=self._overlay_expiry.currentText(),
-            space_mode=self._overlay_space.currentText(),
-            engine_mask=self._selected_engine_mask(),
-            dual_mode=bool(self._overlay_dual_mode.isChecked()),
+        payload = self._cached_page_payload(
+            page="overlay",
+            key=(
+                self._current_greeks_dataset(),
+                self._overlay_greek.currentText(),
+                self._overlay_opt_type.currentText(),
+                self._overlay_expiry.currentText(),
+                self._overlay_space.currentText(),
+                tuple(sorted(self._selected_engine_mask())),
+                bool(self._overlay_dual_mode.isChecked()),
+            ),
+            builder=lambda: build_overlay_frame_payload(
+                frame,
+                greek=self._overlay_greek.currentText(),
+                option_type=self._overlay_opt_type.currentText(),
+                expiry_filter=self._overlay_expiry.currentText(),
+                space_mode=self._overlay_space.currentText(),
+                engine_mask=self._selected_engine_mask(),
+                dual_mode=bool(self._overlay_dual_mode.isChecked()),
+                data_source=self._current_greeks_dataset(),
+            ),
         )
+        self._apply_overlay_payload(payload, version=self._state.last_version)
 
-    def _on_overlay_ready(self, symbol: str, version: int, payload: dict) -> None:  # noqa: ANN401
-        if symbol != self._state.symbol:
-            return
-        snapshot = self._cache.get_snapshot_nowait(symbol)
-        if snapshot is None or snapshot.version != version:
-            return
-        self._cache.publish_overlay_payloads(symbol, version, {"overlay": payload})
-
+    def _apply_overlay_payload(self, payload: dict[str, Any], *, version: int) -> None:
         line_series = payload.get("line_series", {})
         heat = payload.get("heat_image")
         rect = payload.get("rect", (0.0, 0.0, 1.0, 1.0))
@@ -1164,7 +1660,11 @@ class MainWindow(QMainWindow):
             if y_ticks:
                 self._overlay_heat_plot.getAxis("left").setTicks([y_ticks])
         heat2 = payload.get("heat_image_secondary")
+        if heat2 is None:
+            heat2 = payload.get("heat_image_alt")
         rect2 = payload.get("rect_secondary")
+        if rect2 is None:
+            rect2 = payload.get("rect_alt")
         if heat2 is not None and rect2 is not None and self._overlay_dual_mode.isChecked():
             self._overlay_heat_plot_2.setVisible(True)
             self._overlay_heat_img_2.setImage(heat2, autoLevels=False, autoDownsample=True)
@@ -1178,12 +1678,18 @@ class MainWindow(QMainWindow):
         degenerate = " degenerate=single_expiry" if meta.get("is_single_expiry") else ""
         status = meta.get("status", "ok")
         self._overlay_explain.setText(
-            f"{meta.get('chart_explanation', 'Overlay of routed Greeks.')}"
-            f" Source: {meta.get('data_source', 'routed_greeks')}."
+            f"{meta.get('chart_explanation', 'Overlay of Greeks.')}"
+            f" Source: {meta.get('data_source', self._current_greeks_dataset())}."
         )
         self._overlay_status.setText(
-            f"Overlay: mode={self._overlay_space.currentText()} greek={self._overlay_greek.currentText()} rows={meta.get('rows', 0)} engine={meta.get('heat_engine', '')} status={status}{degenerate} v={version}"
+            f"Overlay: mode={self._overlay_space.currentText()} greek={self._overlay_greek.currentText()} "
+            f"rows={meta.get('rows', 0)} engine={meta.get('heat_engine', '')} status={status}{degenerate} v={version}"
         )
+
+    def _on_overlay_ready(self, symbol: str, version: int, payload: dict) -> None:  # noqa: ANN401
+        if symbol != self._state.symbol:
+            return
+        self._apply_overlay_payload(payload, version=version)
 
     def _update_line_plot(self, line_series: dict[str, object]) -> None:
         self._update_plot_series(
@@ -1200,6 +1706,7 @@ class MainWindow(QMainWindow):
         line_series: dict[str, object],
         *,
         control: LineVisibilityControl | None = None,
+        show_markers: bool = False,
     ) -> None:
         existing = set(storage.keys())
         incoming = set(line_series.keys())
@@ -1212,23 +1719,46 @@ class MainWindow(QMainWindow):
             arr = line_series[key]
             if arr is None:
                 continue
+            color = QColor(palette[idx % len(palette)])
             if key not in storage:
                 item = plot.plot(
                     [],
                     [],
-                    pen=pg.mkPen(QColor(palette[idx % len(palette)]), width=2),
+                    pen=pg.mkPen(color, width=2),
                     name=key,
                 )
                 storage[key] = item
             item = storage[key]
-            item.setData(arr[:, 0], arr[:, 1])
+            item.setData(
+                arr[:, 0],
+                arr[:, 1],
+                symbol="o" if show_markers else None,
+                symbolSize=6 if show_markers else 0,
+                symbolBrush=color if show_markers else None,
+                symbolPen=color if show_markers else None,
+            )
         self._sync_line_visibility_controls(control, storage, line_series)
+        self._apply_plot_auto_range(plot, storage)
 
     def _refresh_price_error_plot(self) -> None:
-        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
         surface_points = self._history_frame("surface_points")
-        if (snapshot is None or snapshot.greeks.is_empty()) and surface_points.is_empty():
-            self._price_error_status.setText("Model vs Market: no surface or routed-Greeks data available")
+        greeks_frame = self._current_greeks_frame()
+        if greeks_frame.is_empty() and surface_points.is_empty():
+            self._update_plot_series(
+                self._price_error_plot,
+                self._price_error_line_items,
+                {},
+                control=self._price_error_line_visibility,
+            )
+            self._update_plot_series(
+                self._price_error_delta_plot,
+                self._price_error_delta_items,
+                {},
+                control=self._price_error_delta_visibility,
+            )
+            self._price_error_status.setText(
+                self._with_dataset_error("Model vs Market: no surface or Greeks data available", "surface_points", self._current_greeks_dataset())
+            )
             return
         expiry = self._price_error_expiry.currentText() or "all"
         relative = self._price_error_mode.currentText() == "relative"
@@ -1240,10 +1770,10 @@ class MainWindow(QMainWindow):
                 expiry,
                 relative,
                 tuple(sorted(engine_mask)),
-                "surface_points" if not surface_points.is_empty() else "snapshot",
+                "surface_points" if not surface_points.is_empty() else self._current_greeks_dataset(),
             ),
             builder=lambda: build_price_error_payload(
-                surface_points if not surface_points.is_empty() else snapshot,
+                surface_points if not surface_points.is_empty() else greeks_frame,
                 option_type=self._price_error_option.currentText(),
                 expiry_filter=expiry,
                 engine_mask=engine_mask,
@@ -1266,55 +1796,123 @@ class MainWindow(QMainWindow):
         self._price_error_delta_plot.setLabel("left", "Relative Error" if self._price_error_mode.currentText() == "relative" else "Absolute Error")
         self._price_error_explain.setText(
             f"{meta.get('chart_explanation', 'Model-versus-market price comparison.')}"
-            f" Source: {meta.get('data_source', 'routed_greeks')}."
+            f" Source: {meta.get('data_source', 'surface_points')}."
         )
         self._price_error_status.setText(
-            f"Model vs Market: expiry={expiry} option={self._price_error_option.currentText()} "
-            f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}"
+            self._with_dataset_error(
+                f"Model vs Market: expiry={expiry} option={self._price_error_option.currentText()} "
+                f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}",
+                "surface_points",
+                self._current_greeks_dataset(),
+            )
+        )
+
+    def _refresh_processing_trace_view(self) -> None:
+        frame = self._history_frame("surface_points")
+        if frame.is_empty():
+            for panel_key, plot in self._trace_plots.items():
+                self._update_plot_series(
+                    plot,
+                    self._trace_items[panel_key],
+                    {},
+                    control=self._trace_visibility[panel_key],
+                    show_markers=True,
+                )
+            self._trace_status.setText(
+                self._with_dataset_error("Processing Trace: no surface diagnostics history", "surface_points")
+            )
+            self._trace_explain.setText(
+                "Batch-scoped processing trace from cleaned American quotes through de-Americanization, SSVI validation, and American repricing."
+            )
+            return
+        payload = self._cached_page_payload(
+            page="processing_trace",
+            key=(self._trace_option.currentText(), self._trace_expiry.currentText() or "all"),
+            builder=lambda: build_processing_trace_payload(
+                frame,
+                option_type=self._trace_option.currentText(),
+                expiry_filter=self._trace_expiry.currentText() or "all",
+            ),
+        )
+        panels = payload.get("panels", {})
+        for panel_key, plot in self._trace_plots.items():
+            panel_payload = panels.get(panel_key, {})
+            self._update_plot_series(
+                plot,
+                self._trace_items[panel_key],
+                panel_payload.get("line_series", {}),
+                control=self._trace_visibility[panel_key],
+                show_markers=True,
+            )
+        meta = payload.get("meta", {})
+        self._trace_explain.setText(meta.get("chart_explanation", self._trace_explain.text()))
+        self._trace_status.setText(
+            self._with_dataset_error(
+                f"Processing Trace: expiry={meta.get('selected_expiry', self._trace_expiry.currentText() or 'n/a')} "
+                f"option={self._trace_option.currentText()} rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}",
+                "surface_points",
+            )
         )
 
     def _refresh_validation_view(self) -> None:
         frame = self._history_frame("surface_points")
-        payload = self._cached_page_payload(
-            page="validation_workspace",
-            key=(
-                self._validation_metric.currentText(),
-                self._validation_option.currentText(),
-                self._validation_expiry.currentText() or "all",
-            ),
-            builder=lambda: build_surface_validation_payload(
-                frame,
-                metric=self._validation_metric.currentText(),
-                option_type=self._validation_option.currentText(),
-                expiry_filter=self._validation_expiry.currentText() or "all",
-            ),
-        )
-        self._update_plot_series(
-            self._validation_line_plot,
-            self._validation_line_items,
-            payload.get("line_series", {}),
-            control=self._validation_line_visibility,
-        )
-        heat = payload.get("heat_image")
-        rect = payload.get("rect", (0.0, 0.0, 1.0, 1.0))
-        levels = payload.get("levels", (0.0, 1.0))
-        meta = payload.get("meta", {})
-        show_heat = heat is not None and not bool(meta.get("is_single_expiry"))
-        self._validation_heat_plot.setVisible(show_heat)
-        if show_heat:
-            self._validation_heat_img.setImage(heat, autoLevels=False, autoDownsample=True)
-            self._validation_heat_img.setRect(QRectF(*rect))
-            self._validation_heat_img.setLevels(levels)
-            self._validation_color_bar.setLevels(levels)
-            y_ticks = list(zip(meta.get("y_axis_values", []), meta.get("y_axis_labels", [])))
-            if y_ticks:
-                self._validation_heat_plot.getAxis("left").setTicks([y_ticks])
-        self._validation_explain.setText(meta.get("chart_explanation", "Validation workspace."))
-        self._validation_status.setText(
-            f"Validation Workspace: metric={self._validation_metric.currentText()} "
-            f"expiry={meta.get('selected_expiry', self._validation_expiry.currentText() or 'all')} "
-            f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}"
-        )
+        if frame.is_empty():
+            self._update_plot_series(
+                self._validation_line_plot,
+                self._validation_line_items,
+                {},
+                control=self._validation_line_visibility,
+            )
+            self._validation_heat_plot.setVisible(False)
+            self._validation_explain.setText("Validation workspace.")
+            self._validation_status.setText(
+                self._with_dataset_error("Validation Workspace: no surface diagnostics history", "surface_points", "surface_diagnostics")
+            )
+        else:
+            payload = self._cached_page_payload(
+                page="validation_workspace",
+                key=(
+                    self._validation_metric.currentText(),
+                    self._validation_option.currentText(),
+                    self._validation_expiry.currentText() or "all",
+                ),
+                builder=lambda: build_surface_validation_payload(
+                    frame,
+                    metric=self._validation_metric.currentText(),
+                    option_type=self._validation_option.currentText(),
+                    expiry_filter=self._validation_expiry.currentText() or "all",
+                ),
+            )
+            self._update_plot_series(
+                self._validation_line_plot,
+                self._validation_line_items,
+                payload.get("line_series", {}),
+                control=self._validation_line_visibility,
+            )
+            heat = payload.get("heat_image")
+            rect = payload.get("rect", (0.0, 0.0, 1.0, 1.0))
+            levels = payload.get("levels", (0.0, 1.0))
+            meta = payload.get("meta", {})
+            show_heat = heat is not None and not bool(meta.get("is_single_expiry"))
+            self._validation_heat_plot.setVisible(show_heat)
+            if show_heat:
+                self._validation_heat_img.setImage(heat, autoLevels=False, autoDownsample=True)
+                self._validation_heat_img.setRect(QRectF(*rect))
+                self._validation_heat_img.setLevels(levels)
+                self._validation_color_bar.setLevels(levels)
+                y_ticks = list(zip(meta.get("y_axis_values", []), meta.get("y_axis_labels", [])))
+                if y_ticks:
+                    self._validation_heat_plot.getAxis("left").setTicks([y_ticks])
+            self._validation_explain.setText(meta.get("chart_explanation", "Validation workspace."))
+            self._validation_status.setText(
+                self._with_dataset_error(
+                    f"Validation Workspace: metric={self._validation_metric.currentText()} "
+                    f"expiry={meta.get('selected_expiry', self._validation_expiry.currentText() or 'all')} "
+                    f"rows={meta.get('rows', 0)} status={meta.get('status', 'ok')}",
+                    "surface_points",
+                    "surface_diagnostics",
+                )
+            )
 
         summary = self._history_frame("surface_diagnostics")
         if summary.is_empty():
@@ -1345,6 +1943,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_calendar_density_view(self) -> None:
         frame = self._history_frame("surface_points")
+        if frame.is_empty():
+            self._calendar_heat_plot.setVisible(False)
+            self._update_plot_series(
+                self._density_plot,
+                self._density_items,
+                {},
+                control=self._density_visibility,
+            )
+            self._calendar_violation_model.update([["No calendar diagnostics"]], ["status"])
+            self._calendar_status.setText(
+                self._with_dataset_error("Calendar / Density: no surface diagnostics history", "surface_points")
+            )
+            return
         cal_payload = self._cached_page_payload(
             page="calendar_density_heat",
             key=(self._calendar_option.currentText(),),
@@ -1386,9 +1997,12 @@ class MainWindow(QMainWindow):
             f"{density_meta.get('chart_explanation', 'Density diagnostics.')}"
         )
         self._calendar_status.setText(
-            f"Calendar / Density: violations={meta.get('violation_count', 0)} "
-            f"density_negatives={density_meta.get('negative_points', 0)} "
-            f"status={meta.get('status', 'ok')}/{density_meta.get('status', 'ok')}"
+            self._with_dataset_error(
+                f"Calendar / Density: violations={meta.get('violation_count', 0)} "
+                f"density_negatives={density_meta.get('negative_points', 0)} "
+                f"status={meta.get('status', 'ok')}/{density_meta.get('status', 'ok')}",
+                "surface_points",
+            )
         )
 
         if frame.is_empty():
@@ -1404,6 +2018,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_runtime_metrics_view(self) -> None:
         frame = self._history_frame("runtime_metrics")
+        if frame.is_empty():
+            self._update_plot_series(
+                self._runtime_metrics_plot,
+                self._runtime_metric_items,
+                {},
+                control=self._runtime_metric_visibility,
+            )
+            self._runtime_metrics_model.update([["No runtime metrics"]], ["status"])
+            self._runtime_metrics_status.setText(
+                self._with_dataset_error("Runtime Metrics: no metrics available", "runtime_metrics")
+            )
+            return
         payload = self._cached_page_payload(
             page="runtime_metrics",
             key=(),
@@ -1418,11 +2044,11 @@ class MainWindow(QMainWindow):
         meta = payload.get("meta", {})
         self._runtime_metrics_explain.setText(meta.get("chart_explanation", "Runtime metrics."))
         self._runtime_metrics_status.setText(
-            f"Runtime Metrics: rows={meta.get('rows', 0)} latest_total_ms={meta.get('latest_total_ms', 0.0):.2f} status={meta.get('status', 'ok')}"
+            self._with_dataset_error(
+                f"Runtime Metrics: rows={meta.get('rows', 0)} latest_total_ms={meta.get('latest_total_ms', 0.0):.2f} status={meta.get('status', 'ok')}",
+                "runtime_metrics",
+            )
         )
-        if frame.is_empty():
-            self._runtime_metrics_model.update([["No runtime metrics"]], ["status"])
-            return
         show_cols = [
             c
             for c in (
@@ -1562,8 +2188,14 @@ class MainWindow(QMainWindow):
         trust_text = f"{trust_score:.1f}" if np.isfinite(trust_score) else "n/a"
         self._scanner_explain.setText(meta.get("chart_explanation", self._scanner_explain.text()))
         self._scanner_status.setText(
-            f"SPY Short Expiry Scanner: focus={selected} expiry={meta.get('selected_expiration', 'n/a')} "
-            f"trust={trust_status} score={trust_text} snapshot_age={age_text} status={meta.get('status', 'ok')}"
+            self._with_dataset_error(
+                f"SPY Short Expiry Scanner: focus={selected} expiry={meta.get('selected_expiration', 'n/a')} "
+                f"trust={trust_status} score={trust_text} snapshot_age={age_text} status={meta.get('status', 'ok')}",
+                "focus_expiry_summary",
+                "dealer_exposure_points",
+                "scanner_levels",
+                "flow_proxy_points",
+            )
         )
         return payload
 
@@ -1624,15 +2256,19 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_scanner_drilldown(self, expiration: str) -> None:
+        self._set_combo_text(self._option_chain_expiry, expiration, fallback="all")
         self._set_combo_text(self._overlay_expiry, expiration, fallback="all")
         self._set_combo_text(self._price_error_expiry, expiration)
         self._set_combo_text(self._validation_expiry, expiration, fallback="all")
         self._set_combo_text(self._density_expiry, expiration)
+        self._set_combo_text(self._trace_expiry, expiration)
         self._set_combo_text(self._temporal_expiry, expiration)
+        self._refresh_raw_chain_view()
         self._request_overlay_refresh()
         self._refresh_price_error_plot()
         self._refresh_validation_view()
         self._refresh_calendar_density_view()
+        self._refresh_processing_trace_view()
         self._refresh_temporal_plot()
 
     def _set_combo_text(self, combo: QComboBox, target: str, *, fallback: str | None = None) -> None:
@@ -1839,13 +2475,13 @@ class MainWindow(QMainWindow):
         return "Refresh Latest Snapshot"
 
     def _on_greeks_row_selected(self, index: QModelIndex) -> None:
-        snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
-        if snapshot is None or snapshot.greeks.is_empty():
+        greeks = self._current_greeks_frame()
+        if greeks.is_empty():
             return
-        show_cols = [c for c in self._greeks_model._columns if c in snapshot.greeks.columns]
+        show_cols = [c for c in self._greeks_model._columns if c in greeks.columns]
         if not show_cols:
             return
-        visible = snapshot.greeks.select(show_cols).head(120)
+        visible = greeks.select(show_cols).head(120)
         if index.row() >= visible.height:
             return
         row = visible.row(index.row(), named=True)
@@ -1860,11 +2496,16 @@ class MainWindow(QMainWindow):
         self._greeks_detail.setText(detail)
 
     def _refresh_temporal_controls(self) -> None:
-        history = self._history_frame("greeks")
-        if history.is_empty() and (snapshot := self._cache.get_snapshot_nowait(self._state.symbol)) is not None:
-            history = snapshot.greeks
+        dataset = self._current_greeks_dataset()
+        history = self._history_frame(dataset)
+        if history.is_empty() and dataset == "model_greeks":
+            snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+            if snapshot is not None:
+                history = snapshot.greeks
         if history.is_empty() or "expiration" not in history.columns:
-            self._temporal_status.setText("Temporal Greeks: no routed Greeks history")
+            self._temporal_status.setText(
+                self._with_dataset_error("Temporal Greeks: no Greeks history", dataset)
+            )
             return
         expiries = sorted({str(x) for x in history["expiration"].to_list() if x is not None})
         current = self._temporal_expiry.currentText() if self._temporal_expiry.count() > 0 else ""
@@ -1878,11 +2519,17 @@ class MainWindow(QMainWindow):
         self._refresh_temporal_plot()
 
     def _refresh_temporal_plot(self) -> None:
-        history = self._history_frame("greeks")
-        if history.is_empty() and (snapshot := self._cache.get_snapshot_nowait(self._state.symbol)) is not None:
-            history = snapshot.greeks
+        dataset = self._current_greeks_dataset()
+        self._state.view_scope = self._temporal_scope.currentText()
+        history = self._history_frame(dataset)
+        if history.is_empty() and dataset == "model_greeks":
+            snapshot = self._cache.get_snapshot_nowait(self._state.symbol)
+            if snapshot is not None:
+                history = snapshot.greeks
         if history.is_empty():
-            self._temporal_status.setText("Temporal Greeks: no routed Greeks history")
+            self._temporal_status.setText(
+                self._with_dataset_error("Temporal Greeks: no Greeks history", dataset)
+            )
             return
         expiry = self._temporal_expiry.currentText()
         greek = self._temporal_greek.currentText()
@@ -1915,14 +2562,20 @@ class MainWindow(QMainWindow):
         x = np.asarray(slice_frame["strike"].to_list(), dtype=np.float32)
         y = np.asarray(slice_frame[greek].to_list(), dtype=np.float32)
         self._temporal_line.setData(x, y)
+        self._temporal_plot.enableAutoRange(x=True, y=True)
+        self._temporal_plot.autoRange(padding=0.04)
         self._temporal_plot.setLabel("left", greek)
         self._temporal_time_label.setText(f"Time: {ts}")
+        dataset_label = "model_greeks" if dataset == "model_greeks" else "legacy_greeks"
         self._temporal_explain.setText(
-            "Temporal source: routed_greeks history from cache plus persisted parquet history. "
-            f"X=strike, Y={greek}, slider=batch timestamp, selected expiry={expiry}."
+            f"Temporal source: {dataset_label} history from cache plus persisted parquet history. "
+            f"X=strike, Y={greek}, slider=batch timestamp, selected expiry={expiry}, scope={self._temporal_scope.currentText()}."
         )
         self._temporal_status.setText(
-            f"Temporal Greeks: expiry={expiry} greek={greek} points={slice_frame.height} samples={len(timestamps)}"
+            self._with_dataset_error(
+                f"Temporal Greeks: expiry={expiry} greek={greek} points={slice_frame.height} samples={len(timestamps)}",
+                dataset,
+            )
         )
 
 
@@ -1937,6 +2590,7 @@ def run_ui(
     ui_auto_degrade: bool = True,
     refresh_callback: Callable[[], str] | None = None,
     history_callback: Callable[[str, str], pl.DataFrame] | None = None,
+    history_error_callback: Callable[[str], str | None] | None = None,
     snapshot_timezone: str = "America/New_York",
     market_close_freeze_time: str = "17:00",
     final_prices_refresh_time: str = "17:30",
@@ -1947,6 +2601,9 @@ def run_ui(
     bootstrap_message: str | None = None,
     symbol_search_callback: Callable[[str], list[dict[str, str]]] | None = None,
     expiration_lookup_callback: Callable[[str], list[str]] | None = None,
+    batch_list_callback: Callable[[str], pl.DataFrame] | None = None,
+    batch_select_callback: Callable[[str, str], Any] | None = None,
+    pull_snapshot_callback: Callable[[str], Any] | None = None,
     live_expiration: str | None = None,
     live_expiration_setter: Callable[[str | None], None] | None = None,
     live_expiration_enabled: bool = False,
@@ -1965,6 +2622,7 @@ def run_ui(
         ui_auto_degrade=ui_auto_degrade,
         refresh_callback=refresh_callback,
         history_callback=history_callback,
+        history_error_callback=history_error_callback,
         snapshot_timezone=snapshot_timezone,
         market_close_freeze_time=market_close_freeze_time,
         final_prices_refresh_time=final_prices_refresh_time,
@@ -1975,6 +2633,9 @@ def run_ui(
         bootstrap_message=bootstrap_message,
         symbol_search_callback=symbol_search_callback,
         expiration_lookup_callback=expiration_lookup_callback,
+        batch_list_callback=batch_list_callback,
+        batch_select_callback=batch_select_callback,
+        pull_snapshot_callback=pull_snapshot_callback,
         live_expiration=live_expiration,
         live_expiration_setter=live_expiration_setter,
         live_expiration_enabled=live_expiration_enabled,

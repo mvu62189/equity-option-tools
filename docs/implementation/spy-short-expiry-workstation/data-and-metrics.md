@@ -25,7 +25,7 @@ Key fields:
 
 Purpose:
 
-- strike-by-expiry exposure view for scanner heatmap and dealer-style level framing
+- strike-by-expiry dealer-style exposure view for the scanner heatmap and strike ladder
 
 Key fields:
 
@@ -40,7 +40,7 @@ Key fields:
 
 Purpose:
 
-- explicit batch-over-batch heuristic changes, not tape-derived prints
+- explicit changes between saved snapshots, not tape-derived trades
 
 Key fields:
 
@@ -52,12 +52,12 @@ Key fields:
 - `proxy_confidence`
 - `proxy_reason`
 
-#### Snapshot-To-Snapshot Heuristic Logic
+#### Snapshot-To-Snapshot Logic
 
 Current implementation lives in [short_expiry_scanner.py](d:\equity-option-tools\python\flow_core\orchestration\short_expiry_scanner.py) and works as follows:
 
 1. Build the current dealer-style scanner frame from the latest batch only.
-   This means the proxy never compares partial mixed-batch state.
+   This means the activity estimate never compares partial mixed-batch state.
 
 2. Take the latest previously persisted `dealer_exposure_points` batch as the comparison baseline.
    It does not compare against every historical batch, only the most recent prior scanner batch.
@@ -68,7 +68,7 @@ Current implementation lives in [short_expiry_scanner.py](d:\equity-option-tools
    - `option_type`
    - `strike`
 
-4. For each matched or unmatched current row, compute batch-over-batch deltas:
+4. For each matched or unmatched current row, compute changes between saved snapshots:
    - `delta_volume = current.volume - previous.volume`
    - `delta_open_interest = current.open_interest - previous.open_interest`
    - `delta_avg_market_mid = current.avg_market_mid - previous.avg_market_mid`
@@ -94,15 +94,15 @@ Current implementation lives in [short_expiry_scanner.py](d:\equity-option-tools
    The final score is capped at `0.95`.
 
 8. The heuristic is intentionally descriptive, not inferential.
-   It says “this strike-expiry point changed meaningfully between coherent snapshots” rather than “a sweep happened” or “buyers initiated this trade.”
+   It says "this strike-expiry point changed meaningfully between coherent snapshots" rather than "a sweep happened" or "buyers initiated this trade."
 
 #### What It Can And Cannot Say
 
 Useful signals:
 
-- volume/OI expansion at a specific strike and focused expiry
-- changes in corridor-derived IV context
-- changes in delta/gamma/vega exposure aggregates
+- volume or open-interest expansion at a specific strike and focused expiry
+- changes in the implied-volatility context
+- changes in delta, gamma, or vega exposure aggregates
 - appearance of new hotspots between scanner batches
 
 Hard limits:
@@ -116,7 +116,7 @@ Hard limits:
 #### Edge Cases
 
 - Expiry roll:
-  when `0DTE`, `1DTE`, or `EOW` map to different actual expiries than the previous batch, the proxy is comparing by the resolved actual expiry key, not by label alone.
+  when `0DTE`, `1DTE`, or `EOW` map to different actual expiries than the previous batch, the proxy compares by actual expiry, not by label alone.
 - Missing prior batch:
   new rows will often show large deltas simply because the previous keyed point did not exist.
 - Quality deterioration:
@@ -128,12 +128,12 @@ Hard limits:
 
 - Treat `flow_proxy_points` as a scanner prompt, not as a trade-classification engine.
 - Use them together with:
-  - `focus_expiry_summary` trust status
+  - `focus_expiry_summary` data-quality status
   - `scanner_levels`
-  - price corridor views
-  - IV corridor views
+  - price bid/ask range views
+  - implied-volatility bid/ask range views
   - validation diagnostics
-- If a proxy row is interesting but confidence is low, inspect the underlying quote-quality and surface diagnostics before trusting the signal.
+- If a proxy row is interesting but confidence is low, inspect the underlying quote-cleaning and surface diagnostics before trusting the signal.
 
 ### `scanner_levels`
 
@@ -150,7 +150,7 @@ Key fields:
 - `net_gamma_exposure_oi`
 - `hotspot_score`
 
-## Existing Trust Inputs Reused
+## Existing Inputs Reused
 
 - `quote_quality_points`
 - `surface_points`
@@ -159,6 +159,6 @@ Key fields:
 
 ## Operator Interpretation
 
-- `trusted` means the expiry bucket is comparatively healthy relative to current quote-quality and surface checks.
+- `trusted` means the expiry bucket is comparatively healthy relative to current quote cleaning and fitted-surface checks.
 - `review` means usable but not clean enough to trust without drilldown.
 - `caution` means diagnostics are weak and the scanner output is mainly a prompt to inspect, not to trust blindly.

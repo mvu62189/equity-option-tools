@@ -89,6 +89,39 @@ def _coordinate(strikes: np.ndarray, forward: float, fit_space: FitSpace) -> np.
     return (strikes - fwd) / fwd
 
 
+def ssvi_forward(*, spot: float, rate: float, dividend: float, tau: float) -> float:
+    return float(max(spot, 1e-12) * math.exp((rate - dividend) * tau))
+
+
+def ssvi_total_variance_at(
+    *,
+    strike: float,
+    forward: float,
+    params: SSVIResult,
+    fit_space: FitSpace = "log",
+) -> float:
+    coord = _coordinate(np.asarray([strike], dtype=float), forward=forward, fit_space=fit_space)
+    w = _ssvi_total_variance(coord, np.asarray([params.a, params.b, params.rho, params.m, params.sigma], dtype=float))
+    return float(max(float(w[0]), 1e-12))
+
+
+def ssvi_implied_vol_at(
+    *,
+    strike: float,
+    spot: float,
+    tau: float,
+    rate: float,
+    dividend: float,
+    params: SSVIResult,
+    fit_space: FitSpace = "log",
+) -> float:
+    if not all(math.isfinite(x) for x in (strike, spot, tau, rate, dividend)) or strike <= 0.0 or spot <= 0.0 or tau <= 0.0:
+        return float("nan")
+    forward = ssvi_forward(spot=spot, rate=rate, dividend=dividend, tau=tau)
+    total_variance = ssvi_total_variance_at(strike=strike, forward=forward, params=params, fit_space=fit_space)
+    return float(math.sqrt(max(total_variance, 1e-12) / max(tau, 1e-12)))
+
+
 def _ssvi_total_variance(coord: np.ndarray, p: np.ndarray) -> np.ndarray:
     a, b, rho, m, sigma = p
     return a + b * (rho * (coord - m) + np.sqrt((coord - m) ** 2 + sigma * sigma))
@@ -132,6 +165,9 @@ def calibrate_ssvi(
     coord = _coordinate(strikes, forward=forward, fit_space=fit_space)
     target_w = np.maximum(vols, 1e-8) ** 2 * tau
     weights = _compute_weights(chain_frame, weight_col=weight_col)
+    has_corridor = {"iv_bid", "iv_ask"}.issubset(chain_frame.columns)
+    lower_vol = chain_frame["iv_bid"].to_numpy().astype(float) if "iv_bid" in chain_frame.columns else np.full_like(vols, np.nan)
+    upper_vol = chain_frame["iv_ask"].to_numpy().astype(float) if "iv_ask" in chain_frame.columns else np.full_like(vols, np.nan)
 
     base = DEFAULT_INIT.copy()
     if init_guess:
@@ -166,8 +202,17 @@ def calibrate_ssvi(
 
         def residuals(p: np.ndarray) -> np.ndarray:
             model_w = _ssvi_total_variance(coord, p)
+            model_vol = np.sqrt(np.maximum(model_w, 1e-12) / max(tau, 1e-12))
             penalty = _durrleman_penalty(p, fit_space=fit_space)
-            weighted = np.sqrt(weights) * (model_w - target_w)
+            if has_corridor:
+                corridor_scale = np.maximum(upper_vol - lower_vol, 1e-4)
+                below = np.maximum(lower_vol - model_vol, 0.0) / corridor_scale
+                above = np.maximum(model_vol - upper_vol, 0.0) / corridor_scale
+                outside = 4.0 * (below + above)
+                weak_guide = 0.05 * (model_vol - vols) / corridor_scale
+                weighted = np.sqrt(weights) * (outside + weak_guide)
+            else:
+                weighted = np.sqrt(weights) * (model_w - target_w)
             return np.concatenate([weighted, np.array([penalty])])
 
         fit = least_squares(residuals, x0=guess, bounds=(lb, ub), max_nfev=max_nfev)
@@ -203,6 +248,7 @@ def calibrate_ssvi_cpp(
     chain_frame: pl.DataFrame,
     init_guess: dict[str, float] | None = None,
     constraints: SSVIConstraints | None = None,
+    fit_space: FitSpace = "log",
     rate: float = 0.0,
     dividend: float = 0.0,
     vol_col: str = "implied_vol_input",
@@ -221,44 +267,63 @@ def calibrate_ssvi_cpp(
     tau = _infer_tau(chain_frame)
     forward = spot * math.exp((rate - dividend) * tau)
     weights = _compute_weights(chain_frame, weight_col=weight_col)
+    lower_vol = chain_frame["iv_bid"].to_numpy().astype(float) if "iv_bid" in chain_frame.columns else np.array([], dtype=float)
+    upper_vol = chain_frame["iv_ask"].to_numpy().astype(float) if "iv_ask" in chain_frame.columns else np.array([], dtype=float)
 
-    guess = dict(init_guess or {})
-    if not guess:
-        guess = {"a": 0.01, "b": 0.10, "rho": -0.2, "m": 0.0, "sigma": 0.25}
-    cpp_constraints = {
-        "max_iter": 240.0,
-        "tol": 1e-9,
-        "rho_min": float(constraints.rho_min),
-        "rho_max": float(constraints.rho_max),
-        "b_min": float(constraints.b_min),
-        "sigma_min": float(constraints.sigma_min),
-    }
-    payload = quantcore.calibrate_ssvi_log_slice(
-        strikes.tolist(),
-        vols.tolist(),
-        weights.tolist(),
-        float(forward),
-        float(tau),
-        guess,
-        cpp_constraints,
-    )
-    params = payload.get("params", [])
-    if not isinstance(params, list) or len(params) < 5:
-        raise RuntimeError("invalid_cpp_ssvi_payload")
+    if not hasattr(quantcore, "ssvi_residuals_slice"):
+        raise RuntimeError("quantcore ssvi_residuals_slice entrypoint not available")
 
-    converged = bool(payload.get("converged", False))
-    durrleman = bool(payload.get("durrleman", False))
-    iterations = int(payload.get("iterations", 0))
-    sse = float(payload.get("sse", float("inf")))
-    reason = str(payload.get("reason", "unknown"))
+    base = DEFAULT_INIT.copy()
+    if init_guess:
+        base = np.array(
+            [
+                init_guess.get("a", base[0]),
+                init_guess.get("b", base[1]),
+                init_guess.get("rho", base[2]),
+                init_guess.get("m", base[3]),
+                init_guess.get("sigma", base[4]),
+            ],
+            dtype=float,
+        )
+
+    lb = np.array([-5.0, constraints.b_min, constraints.rho_min, -5.0, constraints.sigma_min])
+    ub = np.array([5.0, 10.0, constraints.rho_max, 5.0, 5.0])
+    max_nfev = 120 if fit_space == "log" else 260
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        payload = quantcore.ssvi_residuals_slice(
+            strikes.tolist(),
+            vols.tolist(),
+            weights.tolist(),
+            lower_vol.tolist(),
+            upper_vol.tolist(),
+            float(forward),
+            float(tau),
+            fit_space,
+            params.tolist(),
+        )
+        return np.asarray(payload, dtype=float)
+
+    fit = least_squares(residuals, x0=base, bounds=(lb, ub), max_nfev=max_nfev)
+    objective = float(np.mean(residuals(fit.x) ** 2))
+    params = fit.x.tolist()
+    converged = bool(fit.success)
+    durrleman = _durrleman_penalty(fit.x, fit_space=fit_space) <= (1e-8 if fit_space == "log" else 1e-5)
+    iterations = int(fit.nfev)
+    sse = float(np.sum(residuals(fit.x) ** 2))
+    if fit_space == "log":
+        success = bool(converged) or (objective < 1e-10 and durrleman)
+    else:
+        success = bool(converged) or (objective < 1e-6 and durrleman)
+    reason = "converged" if converged and durrleman else ("durrleman_violation" if not durrleman else "max_nfev")
     result = SSVIResult(
         a=float(params[0]),
         b=float(params[1]),
         rho=float(params[2]),
         m=float(params[3]),
         sigma=float(params[4]),
-        objective=sse,
-        success=bool(converged and durrleman),
+        objective=objective,
+        success=bool(success and durrleman),
         iterations=iterations,
         durrleman_pass=durrleman,
     )
@@ -266,8 +331,11 @@ def calibrate_ssvi_cpp(
         "backend_used": "cpp",
         "converged": converged,
         "durrleman": durrleman,
+        "objective": objective,
         "sse": sse,
         "iterations": iterations,
         "reason": reason,
+        "fit_space": fit_space,
+        "has_corridor": bool(lower_vol.size and upper_vol.size),
     }
     return result, meta

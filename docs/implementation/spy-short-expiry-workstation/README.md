@@ -13,10 +13,10 @@ Included documents:
 Scope of this implementation:
 
 - SPY-only landing workflow for `0DTE`, `1DTE`, and `EOW`
-- focused short-expiry scanner plus existing drilldown/validation tabs
-- cadence-aware `ui_live` runtime
-- persisted scanner datasets and DuckDB registration
-- batch-scoped UI payload caching
+- short-expiry scanner plus the existing detailed review and validation tabs
+- refresh-aware `ui_live` runtime
+- saved scanner datasets and DuckDB registration
+- reuse of prebuilt chart and table data for one selected saved snapshot
 
 Explicit non-goals for this version:
 

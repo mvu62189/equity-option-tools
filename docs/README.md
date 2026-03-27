@@ -24,6 +24,7 @@ These files explain how currently shipped features were designed and landed. The
 
 - `implementation/`
 - `implementation/spy-short-expiry-workstation/`
+- `implementation/batch-scoped-review-ssvi-trace/`
 
 Useful review entrypoints:
 

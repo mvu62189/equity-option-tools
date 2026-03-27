@@ -4,6 +4,7 @@ import asyncio
 import gc
 import importlib.util
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,10 +30,12 @@ from flow_core.orchestration.state_store import BatchPayload
 from flow_core.quant.deamericanization import evaluate_parity_diagnostics
 from flow_core.quant.dispatch import build_dispatch_summary
 from flow_core.quant.market_inputs import HybridDividendSource, TBillRateCurve
+from flow_core.quant.bs import BSInput, price_euro_bs
+from flow_core.quant.model_greeks import compute_model_greeks
 from flow_core.quant.models import SSVIResult
 from flow_core.quant.routed_greeks import compute_routed_greeks
 from flow_core.quant.routing import annotate_with_routing
-from flow_core.quant.ssvi import calibrate_ssvi, calibrate_ssvi_cpp
+from flow_core.quant.ssvi import calibrate_ssvi, calibrate_ssvi_cpp, ssvi_implied_vol_at
 from flow_core.storage.parquet_store import BufferedParquetWriter, ParquetStore
 
 logger = logging.getLogger(__name__)
@@ -88,11 +91,12 @@ def _run_ssvi_fit(
     backend_used = "python"
     failure_reason = ""
     primary: SSVIResult | None = None
-    if fit_space == "log" and config.ssvi_backend in {"cpp", "auto"}:
+    if config.ssvi_backend in {"cpp", "auto"}:
         try:
             primary_cpp, meta_cpp = calibrate_ssvi_cpp(
                 slice_frame,
                 init_guess=init_guess,
+                fit_space=fit_space,
                 rate=config.parity_rate,
                 dividend=config.parity_dividend,
                 vol_col="implied_vol_input",
@@ -141,20 +145,6 @@ def _run_ssvi_fit(
                 )
                 backend_used = "python"
                 failure_reason = f"fallback:cpp_error:{exc}"
-    elif config.ssvi_backend == "cpp" and fit_space != "log":
-        primary = SSVIResult(
-            a=0.0,
-            b=0.0,
-            rho=0.0,
-            m=0.0,
-            sigma=0.0,
-            objective=float("inf"),
-            success=False,
-            iterations=0,
-            durrleman_pass=False,
-        )
-        backend_used = "cpp"
-        failure_reason = "cpp_ssvi_supports_log_only"
     if primary is None:
         primary = calibrate_ssvi(
             slice_frame,
@@ -180,7 +170,7 @@ def _build_ssvi_outputs(
     source_mode: str,
     config: PipelineConfig,
 ) -> tuple[pl.DataFrame, list[pl.DataFrame], str | None]:
-    required = {"expiration", "option_type", "implied_vol_input", "weight_uniform", "weight_atm", "weight_atm_corridor_tightness"}
+    required = {"expiration", "implied_vol_input", "weight_uniform", "weight_atm", "weight_atm_corridor_tightness"}
     if calibration_input.is_empty() or not required.issubset(calibration_input.columns):
         return pl.DataFrame(), [], None
 
@@ -194,12 +184,14 @@ def _build_ssvi_outputs(
         ("atm_x_corridor_tightness", "weight_atm_corridor_tightness"),
     ]
 
-    for group_key, slice_frame in calibration_input.partition_by(["expiration", "option_type"], as_dict=True).items():
-        if isinstance(group_key, tuple):
-            expiration, option_type = group_key
-        else:
-            expiration = group_key
-            option_type = "all"
+    for expiration, slice_frame in calibration_input.partition_by(["expiration"], as_dict=True).items():
+        if isinstance(expiration, tuple):
+            expiration = expiration[0]
+        option_type = (
+            str(slice_frame["surface_source"][0])
+            if "surface_source" in slice_frame.columns and slice_frame.height > 0
+            else "surface"
+        )
         if slice_frame.height < 3:
             failure = "insufficient_clean_core"
             if ssvi_error is None and config.runtime_mode == "live_strict":
@@ -213,6 +205,7 @@ def _build_ssvi_outputs(
                     "objective": float("inf"),
                     "iterations": 0,
                     "success": False,
+                    "durrleman_pass": False,
                     "a": 0.0,
                     "b": 0.0,
                     "rho": 0.0,
@@ -299,6 +292,7 @@ def _build_ssvi_outputs(
                     "objective": result.objective,
                     "iterations": result.iterations,
                     "success": result.success,
+                    "durrleman_pass": result.durrleman_pass,
                     "a": result.a,
                     "b": result.b,
                     "rho": result.rho,
@@ -337,6 +331,110 @@ def _build_ssvi_outputs(
 
     ssvi_summary = pl.DataFrame(summary_rows) if summary_rows else pl.DataFrame()
     return ssvi_summary, calibration_frames, ssvi_error
+
+
+def _select_primary_ssvi_frame(ssvi_summary: pl.DataFrame) -> pl.DataFrame:
+    if ssvi_summary.is_empty():
+        return pl.DataFrame()
+    priority = {"atm_x_corridor_tightness": 0, "atm_only": 1, "uniform": 2}
+    rows: list[dict[str, object]] = []
+    for group_key, frame in ssvi_summary.partition_by(["expiration"], as_dict=True).items():
+        expiration = group_key[0] if isinstance(group_key, tuple) else group_key
+        ordered = sorted(
+            frame.to_dicts(),
+            key=lambda row: (
+                0 if bool(row.get("success")) else 1,
+                priority.get(str(row.get("weight_mode", "")), 99),
+                float(row.get("objective", float("inf")) or float("inf")),
+            ),
+        )
+        chosen = dict(ordered[0])
+        chosen["expiration"] = expiration
+        rows.append(chosen)
+    return pl.DataFrame(rows)
+
+
+def _evaluate_ssvi_surface_points(points: pl.DataFrame, primary_ssvi: pl.DataFrame, *, fit_space: str) -> pl.DataFrame:
+    if points.is_empty():
+        return points
+    if primary_ssvi.is_empty():
+        return points.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("ssvi_vol"),
+            pl.lit(None, dtype=pl.Float64).alias("ssvi_vol_lower"),
+            pl.lit(None, dtype=pl.Float64).alias("ssvi_vol_upper"),
+            pl.lit(False).alias("ssvi_vol_outside_band"),
+            pl.lit(None, dtype=pl.Float64).alias("ssvi_euro_price"),
+            pl.lit(False).alias("euro_price_inside_band"),
+            pl.lit("").alias("model_batch_role"),
+        )
+    models = {}
+    for row in primary_ssvi.to_dicts():
+        models[str(row.get("expiration"))] = SSVIResult(
+            a=float(row.get("a", 0.0) or 0.0),
+            b=float(row.get("b", 0.0) or 0.0),
+            rho=float(row.get("rho", 0.0) or 0.0),
+            m=float(row.get("m", 0.0) or 0.0),
+            sigma=float(row.get("sigma", 0.0) or 0.0),
+            objective=float(row.get("objective", float("nan")) or float("nan")),
+            success=bool(row.get("success", False)),
+            iterations=int(row.get("iterations", 0) or 0),
+            durrleman_pass=bool(row.get("durrleman_pass", True)),
+        )
+    out_rows: list[dict[str, object]] = []
+    for row in points.to_dicts():
+        out = dict(row)
+        params = models.get(str(row.get("expiration")))
+        ssvi_vol = float("nan")
+        euro_price = float("nan")
+        if params is not None and params.success:
+            ssvi_vol = ssvi_implied_vol_at(
+                strike=float(row.get("strike", float("nan")) or float("nan")),
+                spot=float(row.get("underlying_price", float("nan")) or float("nan")),
+                tau=float(row.get("tau_years", float("nan")) or float("nan")),
+                rate=float(row.get("rate_used", 0.0) or 0.0),
+                dividend=0.0,
+                params=params,
+                fit_space=fit_space,
+            )
+            if math.isfinite(ssvi_vol):
+                euro_price = price_euro_bs(
+                    BSInput(
+                        spot=float(row.get("underlying_price", float("nan")) or float("nan")),
+                        strike=float(row.get("strike", float("nan")) or float("nan")),
+                        rate=float(row.get("rate_used", 0.0) or 0.0),
+                        dividend=0.0,
+                        tau=float(row.get("tau_years", float("nan")) or float("nan")),
+                        vol=float(ssvi_vol),
+                        is_call=str(row.get("option_type", "")).lower() == "call",
+                    )
+                ).price
+        lower = float(row.get("iv_bid", float("nan")) or float("nan"))
+        upper = float(row.get("iv_ask", float("nan")) or float("nan"))
+        euro_bid = float(row.get("euro_price_bid", float("nan")) or float("nan"))
+        euro_ask = float(row.get("euro_price_ask", float("nan")) or float("nan"))
+        out.update(
+            {
+                "ssvi_vol": float(ssvi_vol),
+                "ssvi_vol_lower": lower,
+                "ssvi_vol_upper": upper,
+                "ssvi_vol_outside_band": bool(
+                    math.isfinite(ssvi_vol)
+                    and math.isfinite(lower)
+                    and math.isfinite(upper)
+                    and (ssvi_vol < lower - 1e-9 or ssvi_vol > upper + 1e-9)
+                ),
+                "ssvi_euro_price": float(euro_price),
+                "euro_price_inside_band": bool(
+                    math.isfinite(euro_price)
+                    and math.isfinite(euro_bid)
+                    and math.isfinite(euro_ask)
+                    and euro_bid - 1e-9 <= euro_price <= euro_ask + 1e-9
+                ),
+                "model_batch_role": "selected_batch",
+            }
+        )
+        out_rows.append(out)
+    return pl.DataFrame(out_rows)
 
 
 def _snapshot_catalog_row(
@@ -443,8 +541,8 @@ class QuantPipelineService:
                 import quantcore  # type: ignore
 
                 missing: list[str] = []
-                if self.config.ssvi_backend in {"cpp", "auto"} and not hasattr(quantcore, "calibrate_ssvi_log_slice"):
-                    missing.append("calibrate_ssvi_log_slice")
+                if self.config.ssvi_backend in {"cpp", "auto"} and not hasattr(quantcore, "calibrate_ssvi_slice"):
+                    missing.append("calibrate_ssvi_slice")
                 if self.config.fdm_backend in {"cpp", "auto"} and not hasattr(quantcore, "fdm_cn_log_greeks"):
                     missing.append("fdm_cn_log_greeks")
                 if missing:
@@ -745,7 +843,15 @@ class QuantPipelineService:
                         "dual_delta_ref",
                         "price_second_derivative_ref",
                         "corridor_tightness",
+                        "corridor_width",
                         "vendor_iv_ref",
+                        "iv_bid",
+                        "iv_ask",
+                        "fit_region",
+                        "is_atm_blend",
+                        "blend_source",
+                        "eligible_for_fit",
+                        "excluded_from_fit_reason",
                     )
                     if c in quote_quality_points.columns
                 ]
@@ -779,13 +885,124 @@ class QuantPipelineService:
         )
         latency["pricing_ms"] = (time.perf_counter() - t0) * 1000.0
         latency["greeks_ms"] = latency["pricing_ms"]
-        quality_join_keys = [c for c in ("symbol", "contract_symbol", "expiration", "option_type", "strike") if c in greeks.columns and c in quote_quality_points.columns]
-        surface_input = greeks.join(
+
+        ssvi_summary = pl.DataFrame()
+        calibration_frames: list[pl.DataFrame] = []
+        ssvi_error: str | None = None
+
+        t0 = time.perf_counter()
+        ssvi_summary, calibration_frames, ssvi_error = _build_ssvi_outputs(
+            quote_quality.calibration_input,
+            symbol=symbol,
+            asof_ts=asof_ts,
+            batch_id=batch_id,
+            trading_date=trading_date,
+            snapshot_kind=snapshot_kind,
+            source_mode=source_mode,
+            config=self.config,
+        )
+        if not ssvi_summary.is_empty():
+            ssvi_summary = _tag_frame(
+                ssvi_summary,
+                batch_id=batch_id,
+                symbol=symbol,
+                asof_ts=asof_ts,
+                trading_date=trading_date,
+                snapshot_kind=snapshot_kind,
+                source_mode=source_mode,
+            )
+        if ssvi_error is not None:
+            status["ssvi_fail"] = True
+            status["ssvi_error"] = ssvi_error
+            streak = self._nonconv_count.get(symbol, 0) + 1
+            self._nonconv_count[symbol] = streak
+            if streak >= self.config.nonconvergence_alert_threshold:
+                logger.warning("ssvi_nonconvergence_streak symbol=%s streak=%s err=%s", symbol, streak, ssvi_error)
+        else:
+            self._nonconv_count[symbol] = 0
+        latency["calibration_ms"] = (time.perf_counter() - t0) * 1000.0
+        latency["ssvi_ms"] = latency["calibration_ms"]
+
+        primary_ssvi = _select_primary_ssvi_frame(ssvi_summary)
+        surface_eval = _evaluate_ssvi_surface_points(
             quote_quality_points,
+            primary_ssvi,
+            fit_space=self.config.ssvi_fit_space,
+        )
+        model_greeks = pl.DataFrame()
+        if not routed_pricing.is_empty() and not primary_ssvi.is_empty():
+            ssvi_join = primary_ssvi.select(
+                [
+                    c
+                    for c in (
+                        "expiration",
+                        "a",
+                        "b",
+                        "rho",
+                        "m",
+                        "sigma",
+                        "objective",
+                        "success",
+                        "iterations",
+                        "durrleman_pass",
+                        "weight_mode",
+                        "fit_space",
+                    )
+                    if c in primary_ssvi.columns
+                ]
+            ).rename(
+                {
+                    "a": "ssvi_a",
+                    "b": "ssvi_b",
+                    "rho": "ssvi_rho",
+                    "m": "ssvi_m",
+                    "sigma": "ssvi_sigma",
+                    "objective": "ssvi_objective",
+                    "success": "ssvi_success",
+                    "iterations": "ssvi_iterations",
+                    "durrleman_pass": "ssvi_durrleman_pass",
+                    "weight_mode": "ssvi_weight_mode",
+                    "fit_space": "ssvi_fit_space",
+                }
+            )
+            model_input = routed_pricing.join(ssvi_join, on=[c for c in ("expiration",) if c in routed_pricing.columns and c in ssvi_join.columns], how="left")
+            t0 = time.perf_counter()
+            model_greeks = compute_model_greeks(
+                model_input,
+                dividend_source=self.dividend_source,
+                tree_steps=self.config.parity_tree_steps,
+                rim_nodes=self.config.parity_rim_nodes,
+                fdm_scheme="log",
+                fdm_backend=self.config.fdm_backend,
+                runtime_mode=self.config.runtime_mode,
+                fit_space=self.config.ssvi_fit_space,
+            )
+            model_greeks = _tag_frame(
+                model_greeks,
+                batch_id=batch_id,
+                symbol=symbol,
+                asof_ts=asof_ts,
+                trading_date=trading_date,
+                snapshot_kind=snapshot_kind,
+                source_mode=source_mode,
+            )
+            latency["model_greeks_ms"] = (time.perf_counter() - t0) * 1000.0
+        else:
+            latency["model_greeks_ms"] = 0.0
+
+        quality_join_keys = [c for c in ("symbol", "contract_symbol", "expiration", "option_type", "strike") if c in model_greeks.columns and c in surface_eval.columns]
+        surface_input = model_greeks.join(
+            surface_eval,
             on=quality_join_keys,
             how="left",
             suffix="_quality",
         )
+        if not surface_input.is_empty():
+            surface_input = surface_input.with_columns(
+                pl.col("model_price").alias("ssvi_american_price"),
+                ((pl.col("model_price") >= pl.col("bid") - 1e-9) & (pl.col("model_price") <= pl.col("ask") + 1e-9)).alias("american_price_inside_band"),
+                pl.lit("model_greeks").alias("greeks_source"),
+            )
         surface_bundle = build_surface_diagnostics(surface_input)
         surface_points = _tag_frame(
             surface_bundle.points,
@@ -812,7 +1029,7 @@ class QuantPipelineService:
         previous_dealer_points = self.cache.get_history_nowait(symbol, "dealer_exposure_points")
         scanner_bundle = build_short_expiry_scanner_bundle(
             raw=routed,
-            greeks=greeks,
+            greeks=model_greeks if not model_greeks.is_empty() else greeks,
             surface_points=surface_points,
             previous_dealer_exposure_points=previous_dealer_points,
             focus_labels=list(self.config.live_focus_labels),
@@ -859,43 +1076,6 @@ class QuantPipelineService:
             snapshot_kind=snapshot_kind,
             source_mode=source_mode,
         )
-
-        ssvi_summary = pl.DataFrame()
-        calibration_frames: list[pl.DataFrame] = []
-        ssvi_error: str | None = None
-
-        t0 = time.perf_counter()
-        ssvi_summary, calibration_frames, ssvi_error = _build_ssvi_outputs(
-            quote_quality.calibration_input,
-            symbol=symbol,
-            asof_ts=asof_ts,
-            batch_id=batch_id,
-            trading_date=trading_date,
-            snapshot_kind=snapshot_kind,
-            source_mode=source_mode,
-            config=self.config,
-        )
-        if not ssvi_summary.is_empty():
-            ssvi_summary = _tag_frame(
-                ssvi_summary,
-                batch_id=batch_id,
-                symbol=symbol,
-                asof_ts=asof_ts,
-                trading_date=trading_date,
-                snapshot_kind=snapshot_kind,
-                source_mode=source_mode,
-            )
-        if ssvi_error is not None:
-            status["ssvi_fail"] = True
-            status["ssvi_error"] = ssvi_error
-            streak = self._nonconv_count.get(symbol, 0) + 1
-            self._nonconv_count[symbol] = streak
-            if streak >= self.config.nonconvergence_alert_threshold:
-                logger.warning("ssvi_nonconvergence_streak symbol=%s streak=%s err=%s", symbol, streak, ssvi_error)
-        else:
-            self._nonconv_count[symbol] = 0
-        latency["calibration_ms"] = (time.perf_counter() - t0) * 1000.0
-        latency["ssvi_ms"] = latency["calibration_ms"]
 
         t0 = time.perf_counter()
         dispatch = build_dispatch_summary(routed_pricing)
@@ -990,13 +1170,14 @@ class QuantPipelineService:
                 )
 
         calibration = pl.concat(calibration_frames, how="vertical") if calibration_frames else pl.DataFrame()
+        active_greeks = model_greeks if not model_greeks.is_empty() else greeks
         payload = BatchPayload(
             symbol=symbol,
             batch_id=batch_id,
             version_hint=None,
             updated_at_utc=_now_utc(),
             raw=routed,
-            greeks=greeks,
+            greeks=active_greeks,
             ssvi=ssvi_summary,
             dispatch=dispatch,
             parity=parity_summary,
@@ -1015,6 +1196,7 @@ class QuantPipelineService:
         latency["ui_bridge_ms"] = (time.perf_counter() - t0) * 1000.0
         self.cache.append_history(symbol, "raw", routed)
         self.cache.append_history(symbol, "greeks", greeks)
+        self.cache.append_history(symbol, "model_greeks", model_greeks)
         self.cache.append_history(symbol, "ssvi", ssvi_summary)
         self.cache.append_history(symbol, "dispatch", dispatch)
         self.cache.append_history(symbol, "parity", parity_summary)
@@ -1035,6 +1217,8 @@ class QuantPipelineService:
                 await self.buffered_writer.append_derived(dispatch, dataset="dispatch", partition_col="symbol")
             if not greeks.is_empty():
                 await self.buffered_writer.append_derived(greeks, dataset="greeks", partition_col="symbol")
+            if not model_greeks.is_empty():
+                await self.buffered_writer.append_derived(model_greeks, dataset="model_greeks", partition_col="symbol")
             if not ssvi_summary.is_empty():
                 await self.buffered_writer.append_derived(ssvi_summary, dataset="ssvi", partition_col="symbol")
             if not parity_summary.is_empty():
